@@ -45,8 +45,10 @@ internal static class SelfTest
         var dicts = new Dictionaries();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         dicts.Load();
+        var freq = new Frequencies(); freq.Load();
         Console.WriteLine($"dictionaries: {sw.ElapsedMilliseconds} ms");
         var corrector = new Corrector(dicts, exceptions, settings);
+        var speller = new SpellFixer(dicts, freq, new Autocorrect());
 
         var layouts = Layouts.Installed();
         Console.WriteLine("layouts: " + string.Join(", ", layouts.Select(h => $"{Layouts.Name(h)} ({(long)h:X8})")));
@@ -87,7 +89,7 @@ internal static class SelfTest
 
             sw.Restart();
             var d = corrector.Decide(typed, Native.LangId(typedHkl), alt, Native.LangId(otherHkl), hasDigits);
-            if (d.Kind == ActionKind.FixSpelling) d = corrector.SuggestFix(typed, typedHkl);
+            if (d.Kind == ActionKind.FixSpelling) d = speller.Fix(typed, typedHkl);
             long ms = sw.ElapsedMilliseconds;
 
             string verdict = d.Kind switch
@@ -97,6 +99,8 @@ internal static class SelfTest
                 _ => "keep",
             };
             Console.WriteLine($"{typed,-14} alt={alt,-14} {verdict,-24} {ms,4} ms  {d.Reason}");
+            if (Environment.GetEnvironmentVariable("LAYOUTFIX_SUGGEST") == "1")
+                Console.WriteLine("    suggest: " + string.Join(" | ", dicts.Suggest(Native.LangId(typedHkl), Corrector.StripPunctuation(typed, out _, out _).ToLowerInvariant()).Take(8)));
         }
         return 0;
     }

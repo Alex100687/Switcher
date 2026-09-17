@@ -87,10 +87,10 @@ public static class TypoModel
         int vb = Native.VkKeyScanExW(b, hkl) & 0xFF;
         if (va == 0xFF || vb == 0xFF) return false;
         if (!Grid.TryGetValue(va, out var pa) || !Grid.TryGetValue(vb, out var pb)) return false;
-        int dr = Math.Abs(pa.row - pb.row);
-        int dc = pa.col - pb.col;
-        if (dr == 0) return Math.Abs(dc) == 1;
-        // rows are staggered: the key below sits between two keys above
-        return dr == 1 && Math.Abs(dc) <= 1;
+        if (pa.row == pb.row) return Math.Abs(pa.col - pb.col) == 1;
+        if (Math.Abs(pa.row - pb.row) != 1) return false;
+        // rows are staggered half a key to the right: the key at (r+1, c) touches (r, c) and (r, c+1)
+        var (upper, lower) = pa.row < pb.row ? (pa, pb) : (pb, pa);
+        return lower.col == upper.col || lower.col == upper.col - 1;
     }
 }

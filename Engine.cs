@@ -10,6 +10,7 @@ public sealed class Engine : IDisposable
     private readonly Exceptions _exceptions;
     private readonly Dictionaries _dicts;
     private readonly Corrector _corrector;
+    private readonly SpellFixer _speller;
     private readonly KeyboardHook _hook;
     private readonly WordTracker _word = new();
     private readonly Hotkey _hotkey;
@@ -23,8 +24,9 @@ public sealed class Engine : IDisposable
 
     public event Action<string>? Notify;
 
-    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts)
+    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, SpellFixer speller)
     {
+        _speller = speller;
         _settings = settings;
         _exceptions = exceptions;
         _dicts = dicts;
@@ -147,7 +149,7 @@ public sealed class Engine : IDisposable
             case ActionKind.FixSpelling:
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
                 {
-                    var fix = _corrector.SuggestFix(typed, layout);
+                    var fix = _speller.Fix(typed, layout);
                     if (fix.Kind == ActionKind.FixSpelling && fix.NewText != typed)
                     {
                         Injector.Replace(typed.Length, fix.NewText, boundaryVk);

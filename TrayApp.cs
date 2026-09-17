@@ -15,6 +15,7 @@ public sealed class TrayApp : ApplicationContext
     private readonly Settings _settings;
     private readonly Exceptions _exceptions;
     private readonly Dictionaries _dicts = new();
+    private readonly Frequencies _freq = new();
     private readonly NotifyIcon _icon;
     private readonly Icon _iconOn;
     private readonly Icon _iconOff;
@@ -40,7 +41,7 @@ public sealed class TrayApp : ApplicationContext
         };
         _icon.DoubleClick += (_, _) => ToggleEnabled();
 
-        _engine = new Engine(_settings, _exceptions, _dicts);
+        _engine = new Engine(_settings, _exceptions, _dicts, new SpellFixer(_dicts, _freq, new Autocorrect()));
         _engine.Notify += _ => { };
         try
         {
@@ -55,7 +56,7 @@ public sealed class TrayApp : ApplicationContext
 
         Task.Run(() =>
         {
-            try { _dicts.Load(); }
+            try { _dicts.Load(); _freq.Load(); }
             catch (Exception ex)
             {
                 Log.Write("Dictionary load failed: " + ex);
@@ -83,6 +84,7 @@ public sealed class TrayApp : ApplicationContext
         _miAutostart = Add(menu, "Запускать при входе в Windows", () => { SetAutostart(!IsAutostart()); UpdateUi(); });
         menu.Items.Add(new ToolStripSeparator());
         Add(menu, "Открыть настройки (settings.json)", () => Open(Settings.FilePath));
+        Add(menu, "Открыть автозамены (autocorrect.txt)", () => { EnsureFile(Autocorrect.UserPath, "# что_набрано = на_что_заменить" + Environment.NewLine); Open(Autocorrect.UserPath); });
         Add(menu, "Открыть исключения (exceptions.txt)", () => { EnsureFile(Settings.ExceptionsPath, "# слова, которые не трогать — по одному на строку\n"); Open(Settings.ExceptionsPath); });
         Add(menu, "Открыть лог", () => { EnsureFile(Settings.LogPath, ""); Open(Settings.LogPath); });
         Add(menu, "Открыть папку программы", () => Open(AppContext.BaseDirectory));

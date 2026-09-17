@@ -52,7 +52,7 @@ public sealed class Corrector
         }
 
         // Unknown in both — candidate for a typo fix (needs Suggest, which is slow → async).
-        if (_settings.AutoFixSpelling && coreIsWord && core.Length >= _settings.MinSpellFixLength && core.Length <= 16
+        if (_settings.AutoFixSpelling && coreIsWord && core.Length >= _settings.MinSpellFixLength && core.Length <= 20
             && IsPureLetters(core))
         {
             return new Decision(ActionKind.FixSpelling, "", "unknown word");
@@ -60,34 +60,6 @@ public sealed class Corrector
 
         return Decision.Keep;
     }
-
-    /// <summary>Slow part: ask Hunspell for suggestions and accept only an unambiguous, mechanically plausible slip.</summary>
-    public Decision SuggestFix(string typed, IntPtr hkl)
-    {
-        int lang = Native.LangId(hkl);
-        var core = StripPunctuation(typed, out var prefix, out var suffix);
-        var lower = core.ToLowerInvariant();
-
-        string? best = null;
-        int count = 0;
-        foreach (var s in _dicts.Suggest(lang, lower))
-        {
-            if (s.Length == 0 || s.Contains(' ') || s.Contains('-')) continue;
-            var sl = s.ToLowerInvariant();
-            if (sl == lower) continue;
-            if (Normalize(sl) == Normalize(lower)) return Decision.Keep; // differs only by ё → not a typo
-            if (!TypoModel.IsPlausible(Normalize(lower), Normalize(sl), hkl)) continue;
-            count++;
-            best ??= s;
-            if (count > 1) break;
-        }
-        if (count != 1 || best == null) return Decision.Keep;
-
-        var fixedCore = MatchCase(core, best);
-        return new Decision(ActionKind.FixSpelling, prefix + fixedCore + suffix, $"'{core}' → '{fixedCore}' ({LangName(lang)})");
-    }
-
-    private static string Normalize(string s) => s.Replace('ё', 'е');
 
     public static string LangName(int lang) => lang switch { 0x0419 => "ru", 0x0409 => "en", _ => lang.ToString("X4") };
 

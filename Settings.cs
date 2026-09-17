@@ -13,6 +13,10 @@ public sealed class Settings
     public static string ExceptionsPath => Path.Combine(Dir, "exceptions.txt");
     public static string LogPath => Path.Combine(Dir, "log.txt");
 
+    /// <summary>Bumped when a default changes; old files get the affected fields migrated in <see cref="Load"/>.</summary>
+    public int SettingsVersion { get; set; } // 0 = file written before versioning
+    public const int CurrentVersion = 2;
+
     /// <summary>Master switch.</summary>
     public bool Enabled { get; set; } = true;
 
@@ -26,7 +30,7 @@ public sealed class Settings
     public int MinWordLength { get; set; } = 2;
 
     /// <summary>Shortest word that may be spell-fixed.</summary>
-    public int MinSpellFixLength { get; set; } = 4;
+    public int MinSpellFixLength { get; set; } = 3;
 
     /// <summary>Play a short sound when a word is changed.</summary>
     public bool Beep { get; set; } = false;
@@ -53,7 +57,12 @@ public sealed class Settings
             if (File.Exists(FilePath))
             {
                 var s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath), JsonOptions);
-                if (s != null) return s;
+                if (s != null)
+                {
+                    if (s.SettingsVersion < 2 && s.MinSpellFixLength == 4) s.MinSpellFixLength = 3; // v2: broader spell fixing
+                    if (s.SettingsVersion != CurrentVersion) { s.SettingsVersion = CurrentVersion; s.Save(); }
+                    return s;
+                }
             }
         }
         catch (Exception ex) { Log.Write("Settings load failed: " + ex.Message); }
@@ -66,6 +75,7 @@ public sealed class Settings
     {
         try
         {
+            SettingsVersion = CurrentVersion;
             Directory.CreateDirectory(Dir);
             File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOptions));
         }

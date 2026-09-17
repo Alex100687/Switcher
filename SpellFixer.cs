@@ -97,15 +97,18 @@ public sealed class SpellFixer
     /// The word is unknown in both layouts: try to fix it as typed and as it would read in the other layout
     /// (";spym" → "жызнь" → "жизнь"), and take the better-scoring fix.
     /// </summary>
-    public Decision FixEither(string typed, IntPtr layout, string alt, IntPtr other, bool allowSwitch)
+    public Decision FixEither(string typed, IntPtr layout, string alt, IntPtr other, bool allowSwitch, int contextLang = 0)
     {
         if (!allowSwitch || other == IntPtr.Zero || alt.Length == 0) return Fix(typed, layout);
         var typedTask = Task.Run(() => Fix(typed, layout));
         var asAlt = Fix(alt, other);
         var asTyped = typedTask.GetAwaiter().GetResult();
         if (asAlt.Kind != ActionKind.FixSpelling) return asTyped;
-        // two hypotheses at once (wrong layout AND a typo) — the current-layout fix wins ties
-        if (asTyped.Kind == ActionKind.FixSpelling && asTyped.Score <= asAlt.Score + 0.1) return asTyped;
+        if (asTyped.Kind != ActionKind.FixSpelling) return asAlt with { SwitchLayout = true, Reason = asAlt.Reason + ", switch" };
+        // two hypotheses at once (wrong layout AND a typo): the language of the surrounding text gets a head start,
+        // otherwise the current layout wins ties
+        double bias = contextLang == Native.LangId(other) ? -0.3 : contextLang == Native.LangId(layout) ? 0.3 : 0.1;
+        if (asTyped.Score <= asAlt.Score + bias) return asTyped;
         return asAlt with { SwitchLayout = true, Reason = asAlt.Reason + ", switch" };
     }
 

@@ -62,8 +62,11 @@ internal static class SelfTest
             words = new[] { "ghbdtn", "ghbdtn/", "Ghbdtn", "hello", "руддщ", "привет", "ntrcn", "ыефке", "world", "vbh", "мир",
                             "првиет", "hlelo", "tset", "проект", "лол", "хз", "in", "шт", "ok", "да", "lf", "ща", "elif", "foreach", "ghbdtn,", "vjcrdf" };
 
-        foreach (var w in words)
+        foreach (var raw in words)
         {
+            int ctx = 0; var w = raw;
+            if (w.StartsWith("ru:")) { ctx = Dictionaries.LangRu; w = w[3..]; }
+            else if (w.StartsWith("en:")) { ctx = Dictionaries.LangEn; w = w[3..]; }
             if (Environment.GetEnvironmentVariable("LAYOUTFIX_DEBUG") == "1")
                 Console.WriteLine("  chars: " + string.Join(" ", w.Select(c => ((int)c).ToString("X4"))));
             bool cyr = w.Any(c => c >= 'А' && c <= 'я' || c == 'ё' || c == 'Ё');
@@ -88,8 +91,8 @@ internal static class SelfTest
             bool hasDigits = keys.Any(k => WordTracker.IsDigitKey(k.Vk));
 
             sw.Restart();
-            var d = corrector.Decide(typed, Native.LangId(typedHkl), alt, Native.LangId(otherHkl), hasDigits);
-            if (d.Kind == ActionKind.FixSpelling) d = speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout);
+            var d = corrector.Decide(typed, Native.LangId(typedHkl), alt, Native.LangId(otherHkl), hasDigits, ctx);
+            if (d.Kind == ActionKind.FixSpelling) d = speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout, ctx);
             long ms = sw.ElapsedMilliseconds;
 
             string verdict = d.Kind switch

@@ -25,6 +25,13 @@ public sealed class Corrector
         _freq = freq;
     }
 
+    /// <summary>Word-shaped and known — used to update the language context.</summary>
+    public bool IsRealWord(int lang, string text)
+    {
+        var core = StripPunctuation(text, out _, out _);
+        return core.Length >= 2 && IsWordShaped(core) && IsKnown(lang, core);
+    }
+
     /// <summary>A real word of the language: in the dictionary, in the whitelist/exceptions, or frequent enough in speech (чо, щас).</summary>
     public bool IsKnown(int lang, string word) =>
         _exceptions.Contains(word) || _dicts.Check(lang, word) || _freq.Rank(lang, word) <= SpellFixer.KnownRankLimit(lang);
@@ -33,7 +40,8 @@ public sealed class Corrector
     /// Fast part (dictionary lookups only) — safe to call from the keyboard hook.
     /// Returns SwitchLayout / Keep, or FixSpelling with empty NewText meaning "unknown word, run <see cref="SuggestFix"/> asynchronously".
     /// </summary>
-    public Decision Decide(string typed, int typedLang, string alt, int altLang, bool hasDigits)
+    /// <param name="contextLang">Language of the words typed just before in this window (0 = unknown).</param>
+    public Decision Decide(string typed, int typedLang, string alt, int altLang, bool hasDigits, int contextLang = 0)
     {
         if (!_dicts.IsLoaded || hasDigits) return Decision.Keep;
         if (!_dicts.Supports(typedLang) || !_dicts.Supports(altLang)) return Decision.Keep;
@@ -43,21 +51,31 @@ public sealed class Corrector
 
         if (core.Length == 0) return Decision.Keep;
         if (_exceptions.Contains(core)) return Decision.Keep; // known word (whitelist / user's exceptions)
-        if (IsAllUpper(core)) return Decision.Keep; // abbreviations
+        if (IsCamelCase(core) || IsCamelCase(altCore)) return Decision.Keep; // myVar, GameObject — code, not prose
+        bool allUpper = IsAllUpper(core); // abbreviation (API) — or Caps Lock in the wrong layout (GHBDTN)
 
-        bool coreIsWord = IsWordShaped(core);
-        if (coreIsWord && IsKnown(typedLang, core)) return Decision.Keep;
-
-        // Typed in wrong layout?
         // English dictionary is full of 2-letter abbreviations ("nu", "dr"), so demand one letter more for EN.
         int minLen = altLang == Dictionaries.LangEn ? Math.Max(_settings.MinWordLength, 3) : _settings.MinWordLength;
         // Letters must stay letters: "ютуб" → ".ne," loses two letters to punctuation — not a real conversion.
         bool keepsLetters = alt.Length - altCore.Length <= typed.Length - core.Length;
-        if (_settings.AutoSwitchLayout && altCore.Length >= minLen && IsWordShaped(altCore) && keepsLetters
-            && IsKnown(altLang, altCore))
+        bool altIsWord = _settings.AutoSwitchLayout && altCore.Length >= minLen && IsWordShaped(altCore) && keepsLetters
+                         && IsKnown(altLang, altCore);
+
+        bool coreIsWord = IsWordShaped(core);
+        if (coreIsWord && IsKnown(typedLang, core))
         {
-            return new Decision(ActionKind.SwitchLayout, alt, $"'{core}' not in {LangName(typedLang)}, '{altCore}' in {LangName(altLang)}");
+            // A word in both languages ("tot" = "еще", "ult" = "где", "руку" = "here"): the surrounding text decides,
+            // and with no context a hugely more common word in the other language wins.
+            if (altIsWord && !_exceptions.Contains(core) && PreferOther(core, typedLang, altCore, altLang, contextLang, out var why))
+                return new Decision(ActionKind.SwitchLayout, alt, $"'{core}' ({LangName(typedLang)}) vs '{altCore}' ({LangName(altLang)}): {why}");
+            return Decision.Keep;
         }
+
+        // Typed in wrong layout?
+        if (altIsWord)
+            return new Decision(ActionKind.SwitchLayout, alt, $"'{core}' not in {LangName(typedLang)}, '{altCore}' in {LangName(altLang)}");
+
+        if (allUpper) return Decision.Keep; // don't "fix" abbreviations
 
         // Unknown in both — candidate for a typo fix in either layout (needs Suggest, which is slow → async).
         bool typedFixable = IsPureLetters(core) && core.Length >= _settings.MinSpellFixLength && core.Length <= 20;
@@ -67,6 +85,30 @@ public sealed class Corrector
             return new Decision(ActionKind.FixSpelling, "", "unknown word");
 
         return Decision.Keep;
+    }
+
+    private bool PreferOther(string core, int typedLang, string altCore, int altLang, int contextLang, out string why)
+    {
+        if (contextLang == altLang) { why = "context"; return true; }
+        if (contextLang == typedLang) { why = ""; return false; }
+        int typedRank = _freq.Rank(typedLang, core);
+        int altRank = _freq.Rank(altLang, altCore);
+        // no context: switch only to a very common word from a rare/unknown one (еще:67 vs tot:23264, but not рук:1624 vs her:60)
+        if (altRank <= 300 && (typedRank == int.MaxValue || (typedRank > 3000 && typedRank >= 20L * altRank)))
+        {
+            why = $"rank {altRank} vs {(typedRank == int.MaxValue ? "-" : typedRank)}";
+            return true;
+        }
+        why = "";
+        return false;
+    }
+
+    /// <summary>An uppercase letter after the first one: an identifier (camelCase, PascalCase), not a word.</summary>
+    public static bool IsCamelCase(string s)
+    {
+        if (s.Length < 2 || IsAllUpper(s)) return false;
+        for (int i = 1; i < s.Length; i++) if (char.IsUpper(s[i])) return true;
+        return false;
     }
 
     public static string LangName(int lang) => lang switch { 0x0419 => "ru", 0x0409 => "en", _ => lang.ToString("X4") };
@@ -87,7 +129,7 @@ public sealed class Corrector
         return s.Length > 0;
     }
 
-    private static bool IsAllUpper(string s)
+    public static bool IsAllUpper(string s)
     {
         int letters = 0;
         foreach (var c in s)

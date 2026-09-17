@@ -25,6 +25,18 @@ public sealed class Engine : IDisposable
     private int _epoch;
     private void Invalidate() { Interlocked.Increment(ref _epoch); _word.Reset(); }
 
+    /// <summary>Language of the last real words typed in the current window — the prior for ambiguous words.</summary>
+    private readonly Dictionary<IntPtr, int> _context = new();
+    private int ContextFor(IntPtr hwnd) { lock (_lock) return _context.TryGetValue(hwnd, out var l) ? l : 0; }
+    private void SetContext(IntPtr hwnd, int lang)
+    {
+        lock (_lock)
+        {
+            if (_context.Count > 64) _context.Clear();
+            _context[hwnd] = lang;
+        }
+    }
+
     /// <summary>The last finished word — what is on screen now and what it would be in the other layout.</summary>
     private sealed record LastWord(string Text, IntPtr Layout, string AltText, IntPtr AltLayout,
         int TrailingVk, IntPtr Hwnd, DateTime Time, bool WasAuto, string OriginalCore);
@@ -56,22 +68,19 @@ public sealed class Engine : IDisposable
 
         uint vk = e.Vk;
 
-        if (_hotkey.Matches(vk))
+        if (_hotkey.Matches(vk) && _settings.Enabled)
         {
-            if (_settings.Enabled)
+            // snapshot on the hook thread, act on a worker thread
+            var hk = Native.GetForegroundWindow();
+            IReadOnlyList<TypedKey>? keys = null;
+            IntPtr wordLayout = IntPtr.Zero;
+            if (!_word.IsEmpty && _word.Hwnd == hk)
             {
-                // snapshot on the hook thread, act on a worker thread
-                var hk = Native.GetForegroundWindow();
-                IReadOnlyList<TypedKey>? keys = null;
-                IntPtr wordLayout = IntPtr.Zero;
-                if (!_word.IsEmpty && _word.Hwnd == hk)
-                {
-                    keys = _word.Snapshot();
-                    wordLayout = _word.Layout;
-                }
-                _word.Reset();
-                ThreadPool.QueueUserWorkItem(_ => SafeRun(() => HandleHotkey(hk, keys, wordLayout)));
+                keys = _word.Snapshot();
+                wordLayout = _word.Layout;
             }
+            _word.Reset();
+            ThreadPool.QueueUserWorkItem(_ => SafeRun(() => HandleHotkey(hk, keys, wordLayout)));
             return true;
         }
 
@@ -139,11 +148,14 @@ public sealed class Engine : IDisposable
         int typedLang = Native.LangId(layout);
         int altLang = Native.LangId(other);
 
-        var decision = _corrector.Decide(typed, typedLang, alt, altLang, hasDigits);
+        int ctx = ContextFor(hwnd);
+        var decision = _corrector.Decide(typed, typedLang, alt, altLang, hasDigits, ctx);
+        if (Debug) Log.Write($"decide '{typed}' ctx={Corrector.LangName(ctx)} → {decision.Kind} {decision.Reason}");
 
         switch (decision.Kind)
         {
             case ActionKind.None:
+                if (_corrector.IsRealWord(typedLang, typed)) SetContext(hwnd, typedLang);
                 Remember(typed, layout, alt, other, boundaryVk, hwnd, wasAuto: false);
                 return false;
 
@@ -152,6 +164,7 @@ public sealed class Engine : IDisposable
                 // whatever the user types next, otherwise a fast typist gets the two words interleaved.
                 Injector.SwitchLayout(hwnd, other);
                 Injector.Replace(typed.Length, alt, boundaryVk);
+                SetContext(hwnd, altLang);
                 Remember(alt, other, typed, layout, boundaryVk, hwnd, wasAuto: true);
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {alt}  [{decision.Reason}]")));
                 return true;
@@ -163,7 +176,7 @@ public sealed class Engine : IDisposable
                 string boundary = boundaryVk switch { Native.VK_RETURN => "\n", Native.VK_TAB => "\t", _ => " " };
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
                 {
-                    var fix = _speller.FixEither(typed, layout, alt, other, _settings.AutoSwitchLayout);
+                    var fix = _speller.FixEither(typed, layout, alt, other, _settings.AutoSwitchLayout, ctx);
                     bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != typed;
 
                     // Meanwhile the user may have typed the first letters of the next word: fine, we erase and retype
@@ -190,6 +203,7 @@ public sealed class Engine : IDisposable
                     var newLayout = fix.SwitchLayout ? other : layout;
                     string pendingNew = fix.SwitchLayout ? WordTracker.Render(pending, other) : pendingOld;
                     if (fix.SwitchLayout) { Injector.SwitchLayout(hwnd, other); _word.SetLayout(other); }
+                    SetContext(hwnd, Native.LangId(newLayout));
                     int onScreen = typed.Length + (hold ? 0 : 1) + pendingOld.Length;
                     Injector.Replace(onScreen, fix.NewText + boundary + pendingNew);
                     Remember(fix.NewText, newLayout, typed, layout, boundaryVk, hwnd, wasAuto: true);
@@ -224,6 +238,7 @@ public sealed class Engine : IDisposable
             if (typed.Length == 0 || alt.Length == 0) return;
             Injector.SwitchLayout(hwnd, other);
             Injector.Replace(typed.Length, alt);
+            SetContext(hwnd, Native.LangId(other));
             Remember(alt, other, typed, layout, 0, hwnd, wasAuto: false);
             Report($"[hotkey] {typed} → {alt}");
             return;
@@ -243,6 +258,7 @@ public sealed class Engine : IDisposable
         };
         Injector.SwitchLayout(hwnd, last.AltLayout);
         Injector.Replace(last.Text.Length + trailing.Length, last.AltText + trailing);
+        SetContext(hwnd, Native.LangId(last.AltLayout));
 
         if (last.WasAuto)
         {

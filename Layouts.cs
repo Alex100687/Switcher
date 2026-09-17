@@ -17,7 +17,16 @@ public static class Layouts
     {
         if (hwnd == IntPtr.Zero) return IntPtr.Zero;
         uint tid = Native.GetWindowThreadProcessId(hwnd, out _);
-        return tid == 0 ? IntPtr.Zero : Native.GetKeyboardLayout(tid);
+        var hkl = tid == 0 ? IntPtr.Zero : Native.GetKeyboardLayout(tid);
+        if (hkl != IntPtr.Zero) return hkl;
+        // some hosts (console, UWP frames) report nothing for the top-level window — ask the focused child
+        var focus = Injector.FocusWindow(hwnd);
+        if (focus != hwnd && focus != IntPtr.Zero)
+        {
+            tid = Native.GetWindowThreadProcessId(focus, out _);
+            if (tid != 0) hkl = Native.GetKeyboardLayout(tid);
+        }
+        return hkl;
     }
 
     /// <summary>

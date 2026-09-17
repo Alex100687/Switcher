@@ -88,6 +88,7 @@ public sealed class TrayApp : ApplicationContext
         Add(menu, "Открыть исключения (exceptions.txt)", () => { EnsureFile(Settings.ExceptionsPath, "# слова, которые не трогать — по одному на строку\n"); Open(Settings.ExceptionsPath); });
         Add(menu, "Открыть лог", () => { EnsureFile(Settings.LogPath, ""); Open(Settings.LogPath); });
         Add(menu, "Открыть папку программы", () => Open(AppContext.BaseDirectory));
+        Add(menu, "Перезапустить (перечитать настройки и списки)", Restart);
         menu.Items.Add(new ToolStripSeparator());
         Add(menu, "Выход", () => { _icon.Visible = false; ExitThread(); });
         return menu;
@@ -129,6 +130,15 @@ public sealed class TrayApp : ApplicationContext
     }
 
     private static string Version => typeof(TrayApp).Assembly.GetName().Version?.ToString(3) ?? "1.0";
+
+    private void Restart()
+    {
+        _icon.Visible = false;
+        _engine?.Dispose();
+        try { Process.Start(new ProcessStartInfo(ExePath) { UseShellExecute = true }); }
+        catch (Exception ex) { Log.Write("Restart failed: " + ex.Message); }
+        ExitThread();
+    }
 
     // ------------------------------------------------------------------ autostart
 

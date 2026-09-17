@@ -1,0 +1,5 @@
+* text=auto
+*.ps1 text eol=crlf
+*.dic text eol=lf
+*.aff text eol=lf
+dict/*.txt text eol=lf

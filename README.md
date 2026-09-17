@@ -1,6 +1,7 @@
 # LayoutFix
 
 Автопереключатель раскладки и исправитель опечаток для Windows (свой Punto Switcher).
+Бесплатно, с открытым кодом, без телеметрии и лишних компонентов.
 Живёт в трее, следит за набираемым словом и на пробеле/Enter/Tab решает:
 
 | Ситуация | Что делает |
@@ -48,7 +49,20 @@
 Изменения `settings.json`, `exceptions.txt`, `autocorrect.txt`, сделанные руками, подхватываются после
 «Перезапустить» в меню трея (переключатели в самом меню применяются сразу).
 
-## Установка
+## Скачать и запустить
+
+1. Скачай `LayoutFix-win-x64.zip` со страницы **[Releases](https://github.com/Alex100687/LayoutFix/releases/latest)**.
+2. Распакуй в любую папку (например, `C:\Program Files\LayoutFix` или `%LocalAppData%\Programs\LayoutFix`).
+3. Запусти `LayoutFix.exe` — появится иконка «Яa» в трее. Ничего устанавливать не нужно: .NET внутри.
+4. В меню иконки включи **«Запускать при входе в Windows»**.
+
+Windows SmartScreen при первом запуске может спросить «Неопознанное приложение» — exe не подписан
+сертификатом. «Подробнее» → «Выполнить в любом случае». Антивирусы иногда косятся на программы с глобальным
+хуком клавиатуры — это ожидаемо для любого переключателя раскладки, исходники открыты.
+
+Требуются установленные русская и английская раскладки клавиатуры (Windows 10/11, x64).
+
+## Сборка из исходников
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1
@@ -115,3 +129,9 @@ powershell -ExecutionPolicy Bypass -File tools\e2e.ps1
 * Не работает в программах с защитой от инъекции ввода (некоторые игры с анти-читом) и в окнах с правами
   администратора, если LayoutFix запущен без них.
 * После Enter откат невозможен (в чатах сообщение уже ушло).
+
+## Лицензия
+
+MIT. Словари Hunspell `ru_RU`/`en_US` — из проекта LibreOffice (LGPL/MPL, BSD), частотные списки —
+[hermitdave/FrequencyWords](https://github.com/hermitdave/FrequencyWords) (CC BY-SA 4.0),
+проверка орфографии — [WeCantSpell.Hunspell](https://github.com/aarondandy/WeCantSpell.Hunspell) (MIT).

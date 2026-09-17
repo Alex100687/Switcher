@@ -8,6 +8,7 @@ if (-not $dotnet) { $dotnet = "$env:ProgramFiles\dotnet\dotnet.exe" } else { $do
 if (-not (Test-Path $dotnet)) { throw "Не найден .NET SDK: winget install Microsoft.DotNet.SDK.8" }
 
 Write-Host "Сборка..." -ForegroundColor Cyan
+Remove-Item "$PSScriptRoot\publish" -Recurse -Force -ErrorAction SilentlyContinue  # инкрементальный publish не докладывает файлы в частично пустую папку
 & $dotnet publish "$PSScriptRoot\LayoutFix.csproj" -c Release -r win-x64 --self-contained true `
     -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:DebugType=none -o "$PSScriptRoot\publish" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Сборка не удалась" }
@@ -16,7 +17,10 @@ Get-Process LayoutFix -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
 New-Item -ItemType Directory -Force $dest | Out-Null
-Copy-Item "$PSScriptRoot\publish\*" $dest -Recurse -Force
+# robocopy: Copy-Item "src\*" -Recurse в PS 5.1 теряет вложенные файлы
+& robocopy "$PSScriptRoot\publish" $dest /MIR /NJH /NJS /NFL /NDL | Out-Null
+if ($LASTEXITCODE -ge 8) { throw "Копирование не удалось (robocopy $LASTEXITCODE)" }
+if (-not (Test-Path (Join-Path $dest 'dict/ru_RU.dic'))) { throw "Словари не скопировались" }
 
 $exe = Join-Path $dest 'LayoutFix.exe'
 Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'LayoutFix' -Value "`"$exe`""

@@ -41,7 +41,7 @@ public sealed class TrayApp : ApplicationContext
         };
         _icon.DoubleClick += (_, _) => ToggleEnabled();
 
-        _engine = new Engine(_settings, _exceptions, _dicts, new SpellFixer(_dicts, _freq, new Autocorrect()));
+        _engine = new Engine(_settings, _exceptions, _dicts, _freq, new SpellFixer(_dicts, _freq, new Autocorrect()));
         _engine.Notify += _ => { };
         try
         {

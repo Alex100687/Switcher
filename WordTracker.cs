@@ -7,42 +7,68 @@ public readonly record struct TypedKey(uint Vk, uint Scan, bool Shift, bool Caps
 /// <summary>Buffer of physical keys of the word currently being typed. Rendering to text is done per layout.</summary>
 public sealed class WordTracker
 {
+    // written by the hook (UI) thread, read by the spell-fix worker — guard everything
+    private readonly object _lock = new();
     private readonly List<TypedKey> _keys = new();
+    private IntPtr _layout, _hwnd;
+    private bool _hasDigits;
 
-    public IntPtr Layout { get; private set; }
-    public IntPtr Hwnd { get; private set; }
-    public bool HasDigits { get; private set; }
-    public int Count => _keys.Count;
-    public bool IsEmpty => _keys.Count == 0;
+    public IntPtr Layout { get { lock (_lock) return _layout; } }
+    public IntPtr Hwnd { get { lock (_lock) return _hwnd; } }
+    public bool HasDigits { get { lock (_lock) return _hasDigits; } }
+    public int Count { get { lock (_lock) return _keys.Count; } }
+    public bool IsEmpty => Count == 0;
 
-    public void Reset()
+    public void Reset() { lock (_lock) ResetLocked(); }
+
+    private void ResetLocked()
     {
         _keys.Clear();
-        HasDigits = false;
-        Layout = IntPtr.Zero;
-        Hwnd = IntPtr.Zero;
+        _hasDigits = false;
+        _layout = IntPtr.Zero;
+        _hwnd = IntPtr.Zero;
     }
 
     public void Push(uint vk, uint scan, IntPtr layout, IntPtr hwnd)
     {
-        if (_keys.Count == 0)
-        {
-            Layout = layout;
-            Hwnd = hwnd;
-        }
-        if (IsDigitKey(vk)) HasDigits = true;
         bool shift = Native.IsDown(Native.VK_SHIFT) || Native.IsDown(Native.VK_LSHIFT) || Native.IsDown(Native.VK_RSHIFT);
         bool caps = Native.IsToggled(Native.VK_CAPITAL);
-        _keys.Add(new TypedKey(vk, scan, shift, caps));
-        // don't let the buffer grow forever on a pasted-looking stream
-        if (_keys.Count > 64) Reset();
+        lock (_lock)
+        {
+            if (_keys.Count == 0)
+            {
+                _layout = layout;
+                _hwnd = hwnd;
+            }
+            if (IsDigitKey(vk)) _hasDigits = true;
+            _keys.Add(new TypedKey(vk, scan, shift, caps));
+            // don't let the buffer grow forever on a pasted-looking stream
+            if (_keys.Count > 64) ResetLocked();
+        }
     }
 
     public void Backspace()
     {
-        if (_keys.Count > 0) _keys.RemoveAt(_keys.Count - 1);
-        if (_keys.Count == 0) Reset();
-        else HasDigits = _keys.Any(k => IsDigitKey(k.Vk));
+        lock (_lock)
+        {
+            if (_keys.Count > 0) _keys.RemoveAt(_keys.Count - 1);
+            if (_keys.Count == 0) ResetLocked();
+            else _hasDigits = _keys.Any(k => IsDigitKey(k.Vk));
+        }
+    }
+
+    /// <summary>After we switched the window's layout, the keys typed since belong to the new layout.</summary>
+    public void SetLayout(IntPtr layout) { lock (_lock) if (_keys.Count > 0) _layout = layout; }
+
+    /// <summary>Atomically: the keys typed so far in this window (empty if the user moved to another window).</summary>
+    public bool TryPending(IntPtr hwnd, out IReadOnlyList<TypedKey> keys, out IntPtr layout)
+    {
+        lock (_lock)
+        {
+            keys = _keys.ToArray();
+            layout = _layout;
+            return _keys.Count == 0 || _hwnd == hwnd;
+        }
     }
 
     public static bool IsDigitKey(uint vk) => (vk >= '0' && vk <= '9') || (vk >= Native.VK_NUMPAD0 && vk <= Native.VK_NUMPAD9);
@@ -80,5 +106,5 @@ public sealed class WordTracker
         return sb.ToString();
     }
 
-    public IReadOnlyList<TypedKey> Snapshot() => _keys.ToArray();
+    public IReadOnlyList<TypedKey> Snapshot() { lock (_lock) return _keys.ToArray(); }
 }

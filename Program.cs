@@ -47,7 +47,7 @@ internal static class SelfTest
         dicts.Load();
         var freq = new Frequencies(); freq.Load();
         Console.WriteLine($"dictionaries: {sw.ElapsedMilliseconds} ms");
-        var corrector = new Corrector(dicts, exceptions, settings);
+        var corrector = new Corrector(dicts, exceptions, settings, freq);
         var speller = new SpellFixer(dicts, freq, new Autocorrect());
 
         var layouts = Layouts.Installed();
@@ -89,13 +89,13 @@ internal static class SelfTest
 
             sw.Restart();
             var d = corrector.Decide(typed, Native.LangId(typedHkl), alt, Native.LangId(otherHkl), hasDigits);
-            if (d.Kind == ActionKind.FixSpelling) d = speller.Fix(typed, typedHkl);
+            if (d.Kind == ActionKind.FixSpelling) d = speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout);
             long ms = sw.ElapsedMilliseconds;
 
             string verdict = d.Kind switch
             {
                 ActionKind.SwitchLayout => $"SWITCH → {d.NewText}",
-                ActionKind.FixSpelling => $"FIX    → {d.NewText}",
+                ActionKind.FixSpelling => (d.SwitchLayout ? "FIX+SW → " : "FIX    → ") + d.NewText,
                 _ => "keep",
             };
             Console.WriteLine($"{typed,-14} alt={alt,-14} {verdict,-24} {ms,4} ms  {d.Reason}");

@@ -91,32 +91,48 @@ public sealed class SpellFixer
     }
 
     /// <summary>Typed words at least this frequent are treated as real (colloquial) words and left alone.</summary>
-    private static int KnownRankLimit(int lang) => lang == Dictionaries.LangRu ? 10_000 : 5_000;
+    public static int KnownRankLimit(int lang) => lang == Dictionaries.LangRu ? 10_000 : 5_000;
+
+    /// <summary>
+    /// The word is unknown in both layouts: try to fix it as typed and as it would read in the other layout
+    /// (";spym" → "жызнь" → "жизнь"), and take the better-scoring fix.
+    /// </summary>
+    public Decision FixEither(string typed, IntPtr layout, string alt, IntPtr other, bool allowSwitch)
+    {
+        if (!allowSwitch || other == IntPtr.Zero || alt.Length == 0) return Fix(typed, layout);
+        var typedTask = Task.Run(() => Fix(typed, layout));
+        var asAlt = Fix(alt, other);
+        var asTyped = typedTask.GetAwaiter().GetResult();
+        if (asAlt.Kind != ActionKind.FixSpelling) return asTyped;
+        // two hypotheses at once (wrong layout AND a typo) — the current-layout fix wins ties
+        if (asTyped.Kind == ActionKind.FixSpelling && asTyped.Score <= asAlt.Score + 0.1) return asTyped;
+        return asAlt with { SwitchLayout = true, Reason = asAlt.Reason + ", switch" };
+    }
 
     public Decision Fix(string typed, IntPtr hkl)
     {
         int lang = Native.LangId(hkl);
         var core = Corrector.StripPunctuation(typed, out var prefix, out var suffix);
-        if (core.Length < 3) return Decision.Keep;
+        if (core.Length < 3 || !Corrector.IsPureLetters(core)) return Decision.Keep;
         var lower = core.ToLowerInvariant();
 
         if (_auto.TryGet(lower, out var explicitFix))
-            return Result(core, explicitFix, prefix, suffix, lang, "autocorrect");
+            return Result(core, explicitFix, prefix, suffix, lang, "autocorrect", 0);
 
         if (_freq.Rank(lang, lower) <= KnownRankLimit(lang)) return Decision.Keep; // frequent colloquial word
 
         var norm = EditCost.Normalize(lower);
         bool capitalized = char.IsUpper(core[0]);
-        var best = ChooseBest(norm, lang, hkl, capitalized, out var reason);
+        var best = ChooseBest(norm, lang, hkl, capitalized, out var reason, out var score);
         if (best == null) return Decision.Keep;
-        return Result(core, best, prefix, suffix, lang, reason);
+        return Result(core, best, prefix, suffix, lang, reason, score);
     }
 
-    private static Decision Result(string core, string fix, string prefix, string suffix, int lang, string reason)
+    private static Decision Result(string core, string fix, string prefix, string suffix, int lang, string reason, double score)
     {
         var cased = Corrector.MatchCase(core, fix);
         if (cased == core) return Decision.Keep;
-        return new Decision(ActionKind.FixSpelling, prefix + cased + suffix, $"'{core}' → '{cased}' ({Corrector.LangName(lang)}, {reason})");
+        return new Decision(ActionKind.FixSpelling, prefix + cased + suffix, $"'{core}' → '{cased}' ({Corrector.LangName(lang)}, {reason})", score);
     }
 
     private sealed record Cand(string Word, double Cost, int Rank)
@@ -126,9 +142,9 @@ public sealed class SpellFixer
         private static double RankPenalty(int r) => r == int.MaxValue ? 0.85 : 0.12 * Math.Log10(r);
     }
 
-    private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason)
+    private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason, out double score)
     {
-        reason = "";
+        reason = ""; score = 0;
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var cands = new List<Cand>();
 
@@ -174,7 +190,8 @@ public sealed class SpellFixer
         if (len == 4 && (best.Cost > 1.0 || best.Rank > 10_000)) return null;
         if (capitalized && best.Rank > 10_000) return null;            // probably a name we don't know (Вельск ≠ Вольск)
 
-        reason = $"cost {best.Cost:0.00}, rank {(best.Rank == int.MaxValue ? "-" : best.Rank.ToString())}";
+        reason = $"cost {best.Cost:0.00}, rank {best.Rank}";
+        score = best.Score;
         return best.Word;
     }
 }

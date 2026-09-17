@@ -25,7 +25,12 @@ $form.Show(); $form.Activate(); $tb.Focus()
 $en = [System.Windows.Forms.InputLanguage]::InstalledInputLanguages | ? { $_.Culture.Name -eq 'en-US' }
 $ru = [System.Windows.Forms.InputLanguage]::InstalledInputLanguages | ? { $_.Culture.Name -eq 'ru-RU' }
 
+Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();'
 function Step($name, $lang, $keys, $expected) {
+    if ([W.U]::GetForegroundWindow() -ne $form.Handle) {
+        $form.Activate(); [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+        if ([W.U]::GetForegroundWindow() -ne $form.Handle) { "ABORT ${name}: test window is not in the foreground, refusing to type into another app"; return }
+    }
     $tb.Clear()
     [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang
     [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
@@ -51,6 +56,10 @@ Step "ru autocorrect"   $ru "вобщем "        "в общем "
 Step "en ortho fix"     $en "teh "           "the "
 Step "jargon keep"      $ru "пивот "         "пивот "
 Step "command keep"     $en "sudo "          "sudo "
+Step "fix + switch"      $en ";spym "         "жизнь "
+Step "fix+switch fast"   $en "cltfknm rfr ltkf " "сделать как дела "
+Step "fix fast"          $ru "првиет как дела " "привет как дела "
+Step "nofix fast"        $en "asdf qwer "      "asdf qwer "
 Step "ru sentence"      $en "ghbdtn rfr ltkf "  "привет как дела "
 Step "backspace"        $en "ghbdtnn{BS} "   "привет "
 Step "enter boundary"   $en "ntrcn{ENTER}"   "текст`r`n"

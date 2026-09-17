@@ -17,6 +17,14 @@ public sealed class Engine : IDisposable
     private readonly Dictionary<uint, string> _processNames = new();
     private readonly object _lock = new();
 
+    /// <summary>
+    /// Bumped whenever the text after the last word boundary stops being "just the letters in <see cref="_word"/>":
+    /// another boundary, navigation, mouse click, window change, a backspace into the previous word.
+    /// A pending spell fix compares it to know whether it still knows what is on screen.
+    /// </summary>
+    private int _epoch;
+    private void Invalidate() { Interlocked.Increment(ref _epoch); _word.Reset(); }
+
     /// <summary>The last finished word — what is on screen now and what it would be in the other layout.</summary>
     private sealed record LastWord(string Text, IntPtr Layout, string AltText, IntPtr AltLayout,
         int TrailingVk, IntPtr Hwnd, DateTime Time, bool WasAuto, string OriginalCore);
@@ -24,15 +32,15 @@ public sealed class Engine : IDisposable
 
     public event Action<string>? Notify;
 
-    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, SpellFixer speller)
+    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller)
     {
         _speller = speller;
         _settings = settings;
         _exceptions = exceptions;
         _dicts = dicts;
-        _corrector = new Corrector(dicts, exceptions, settings);
+        _corrector = new Corrector(dicts, exceptions, settings, freq);
         _hotkey = Hotkey.Parse(settings.Hotkey);
-        _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = () => _word.Reset() };
+        _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = Invalidate };
     }
 
     public void Start() => _hook.Install();
@@ -72,7 +80,7 @@ public sealed class Engine : IDisposable
         if (Native.IsDown(Native.VK_CONTROL) || Native.IsDown(Native.VK_MENU) ||
             Native.IsDown(Native.VK_LWIN) || Native.IsDown(Native.VK_RWIN))
         {
-            _word.Reset();
+            Invalidate();
             return false;
         }
 
@@ -82,18 +90,19 @@ public sealed class Engine : IDisposable
         var layout = Layouts.Current(hwnd);
 
         if (!_word.IsEmpty && (hwnd != _word.Hwnd || (layout != IntPtr.Zero && layout != _word.Layout)))
-            _word.Reset();
+            Invalidate();
 
         if (WordTracker.IsWordKey(vk))
         {
-            if (layout == IntPtr.Zero) { _word.Reset(); return false; }
+            if (layout == IntPtr.Zero) { Invalidate(); return false; }
             _word.Push(vk, e.Scan, layout, hwnd);
             return false;
         }
 
         if (vk == Native.VK_BACK)
         {
-            _word.Backspace();
+            if (_word.IsEmpty) Invalidate(); // deleting into the previous word — we no longer know what's there
+            else _word.Backspace();
             return false;
         }
 
@@ -101,12 +110,12 @@ public sealed class Engine : IDisposable
         {
             if (_word.IsEmpty) return false;
             // Shift+Enter etc. — let it through untouched, but the word is finished.
-            if (vk != Native.VK_SPACE && Native.IsDown(Native.VK_SHIFT)) { _word.Reset(); return false; }
+            if (vk != Native.VK_SPACE && Native.IsDown(Native.VK_SHIFT)) { Invalidate(); return false; }
             return OnWordBoundary((int)vk, hwnd);
         }
 
         // navigation, escape, delete, function keys… — word is abandoned
-        _word.Reset();
+        Invalidate();
         return false;
     }
 
@@ -118,6 +127,7 @@ public sealed class Engine : IDisposable
         var keys = _word.Snapshot();
         bool hasDigits = _word.HasDigits;
         _word.Reset();
+        int epoch = Interlocked.Increment(ref _epoch);
 
         if (other == IntPtr.Zero || IsExcluded(hwnd)) return false;
 
@@ -147,22 +157,45 @@ public sealed class Engine : IDisposable
                 return true;
 
             case ActionKind.FixSpelling:
+                // Suggest takes ~100 ms, so this runs on a worker. A space goes through to the app right away
+                // (no typing lag); Enter/Tab are held back, because in a chat Enter would send the unfixed word.
+                bool hold = boundaryVk != Native.VK_SPACE;
+                string boundary = boundaryVk switch { Native.VK_RETURN => "\n", Native.VK_TAB => "\t", _ => " " };
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
                 {
-                    var fix = _speller.Fix(typed, layout);
-                    if (fix.Kind == ActionKind.FixSpelling && fix.NewText != typed)
+                    var fix = _speller.FixEither(typed, layout, alt, other, _settings.AutoSwitchLayout);
+                    bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != typed;
+
+                    // Meanwhile the user may have typed the first letters of the next word: fine, we erase and retype
+                    // them too (in the new layout if we switch). Anything else — another word finished, a click,
+                    // an arrow key, a different window — means we no longer know what is on screen: skip the fix.
+                    IReadOnlyList<TypedKey> pending = Array.Empty<TypedKey>();
+                    IntPtr pendingLayout = IntPtr.Zero;
+                    bool known = Volatile.Read(ref _epoch) == epoch && _word.TryPending(hwnd, out pending, out pendingLayout);
+                    if (!known)
                     {
-                        Injector.Replace(typed.Length, fix.NewText, boundaryVk);
-                        Remember(fix.NewText, layout, typed, layout, boundaryVk, hwnd, wasAuto: true);
-                        Report($"{typed} → {fix.NewText}  [{fix.Reason}]");
+                        if (hold) Injector.PressKey(boundaryVk); // best effort: at least deliver the held Enter/Tab
+                        return;
                     }
-                    else
+                    if (pendingLayout == IntPtr.Zero) pendingLayout = layout;
+                    string pendingOld = WordTracker.Render(pending, pendingLayout);
+
+                    if (!fixing)
                     {
-                        Injector.PressKey(boundaryVk);
+                        if (hold) Injector.Replace(pendingOld.Length, boundary + pendingOld); // put the held Enter/Tab before the new letters
                         Remember(typed, layout, alt, other, boundaryVk, hwnd, wasAuto: false);
+                        return;
                     }
+
+                    var newLayout = fix.SwitchLayout ? other : layout;
+                    string pendingNew = fix.SwitchLayout ? WordTracker.Render(pending, other) : pendingOld;
+                    if (fix.SwitchLayout) { Injector.SwitchLayout(hwnd, other); _word.SetLayout(other); }
+                    int onScreen = typed.Length + (hold ? 0 : 1) + pendingOld.Length;
+                    Injector.Replace(onScreen, fix.NewText + boundary + pendingNew);
+                    Remember(fix.NewText, newLayout, typed, layout, boundaryVk, hwnd, wasAuto: true);
+                    Report($"{typed} → {fix.NewText}  [{fix.Reason}]");
                 }));
-                return true;
+                return hold;
         }
         return false;
     }

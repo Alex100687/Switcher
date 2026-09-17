@@ -2,7 +2,9 @@ namespace LayoutFix;
 
 public enum ActionKind { None, SwitchLayout, FixSpelling }
 
-public sealed record Decision(ActionKind Kind, string NewText, string Reason)
+/// <param name="Score">Lower is better; used to compare candidate fixes.</param>
+/// <param name="SwitchLayout">The fix is in the other layout: switch it and type the fixed word.</param>
+public sealed record Decision(ActionKind Kind, string NewText, string Reason, double Score = 0, bool SwitchLayout = false)
 {
     public static readonly Decision Keep = new(ActionKind.None, "", "");
 }
@@ -13,13 +15,19 @@ public sealed class Corrector
     private readonly Dictionaries _dicts;
     private readonly Exceptions _exceptions;
     private readonly Settings _settings;
+    private readonly Frequencies _freq;
 
-    public Corrector(Dictionaries dicts, Exceptions exceptions, Settings settings)
+    public Corrector(Dictionaries dicts, Exceptions exceptions, Settings settings, Frequencies freq)
     {
         _dicts = dicts;
         _exceptions = exceptions;
         _settings = settings;
+        _freq = freq;
     }
+
+    /// <summary>A real word of the language: in the dictionary, in the whitelist/exceptions, or frequent enough in speech (чо, щас).</summary>
+    public bool IsKnown(int lang, string word) =>
+        _exceptions.Contains(word) || _dicts.Check(lang, word) || _freq.Rank(lang, word) <= SpellFixer.KnownRankLimit(lang);
 
     /// <summary>
     /// Fast part (dictionary lookups only) — safe to call from the keyboard hook.
@@ -38,7 +46,7 @@ public sealed class Corrector
         if (IsAllUpper(core)) return Decision.Keep; // abbreviations
 
         bool coreIsWord = IsWordShaped(core);
-        if (coreIsWord && _dicts.Check(typedLang, core)) return Decision.Keep;
+        if (coreIsWord && IsKnown(typedLang, core)) return Decision.Keep;
 
         // Typed in wrong layout?
         // English dictionary is full of 2-letter abbreviations ("nu", "dr"), so demand one letter more for EN.
@@ -46,17 +54,17 @@ public sealed class Corrector
         // Letters must stay letters: "ютуб" → ".ne," loses two letters to punctuation — not a real conversion.
         bool keepsLetters = alt.Length - altCore.Length <= typed.Length - core.Length;
         if (_settings.AutoSwitchLayout && altCore.Length >= minLen && IsWordShaped(altCore) && keepsLetters
-            && (_exceptions.Contains(altCore) || _dicts.Check(altLang, altCore)))
+            && IsKnown(altLang, altCore))
         {
             return new Decision(ActionKind.SwitchLayout, alt, $"'{core}' not in {LangName(typedLang)}, '{altCore}' in {LangName(altLang)}");
         }
 
-        // Unknown in both — candidate for a typo fix (needs Suggest, which is slow → async).
-        if (_settings.AutoFixSpelling && coreIsWord && core.Length >= _settings.MinSpellFixLength && core.Length <= 20
-            && IsPureLetters(core))
-        {
+        // Unknown in both — candidate for a typo fix in either layout (needs Suggest, which is slow → async).
+        bool typedFixable = IsPureLetters(core) && core.Length >= _settings.MinSpellFixLength && core.Length <= 20;
+        bool altFixable = _settings.AutoSwitchLayout && keepsLetters && IsPureLetters(altCore)
+                          && altCore.Length >= Math.Max(_settings.MinSpellFixLength, minLen) && altCore.Length <= 20;
+        if (_settings.AutoFixSpelling && (typedFixable || altFixable))
             return new Decision(ActionKind.FixSpelling, "", "unknown word");
-        }
 
         return Decision.Keep;
     }

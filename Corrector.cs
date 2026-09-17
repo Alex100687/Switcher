@@ -34,7 +34,15 @@ public sealed class Corrector
 
     /// <summary>A real word of the language: in the dictionary, in the whitelist/exceptions, or frequent enough in speech (чо, щас).</summary>
     public bool IsKnown(int lang, string word) =>
-        _exceptions.Contains(word) || _dicts.Check(lang, word) || _freq.Rank(lang, word) <= SpellFixer.KnownRankLimit(lang);
+        _exceptions.Contains(word) || _dicts.Check(lang, word) || IsFrequent(lang, word);
+
+    /// <summary>Colloquial word by frequency alone (чо, щас). Two-letter tokens in the lists are noisy ("lf", "bp"): Russian top-5000 only.</summary>
+    private bool IsFrequent(int lang, string word)
+    {
+        int rank = _freq.Rank(lang, word);
+        if (word.Length >= 3) return rank <= SpellFixer.KnownRankLimit(lang);
+        return lang == Dictionaries.LangRu && rank <= 5_000;
+    }
 
     /// <summary>
     /// Fast part (dictionary lookups only) — safe to call from the keyboard hook.
@@ -87,7 +95,7 @@ public sealed class Corrector
         return Decision.Keep;
     }
 
-    private bool PreferOther(string core, int typedLang, string altCore, int altLang, int contextLang, out string why)
+    public bool PreferOther(string core, int typedLang, string altCore, int altLang, int contextLang, out string why)
     {
         if (contextLang == altLang) { why = "context"; return true; }
         if (contextLang == typedLang) { why = ""; return false; }

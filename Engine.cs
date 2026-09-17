@@ -11,6 +11,8 @@ public sealed class Engine : IDisposable
     private readonly Dictionaries _dicts;
     private readonly Corrector _corrector;
     private readonly SpellFixer _speller;
+    /// <summary>Runs an action on the hook (UI) thread: every SendInput goes through it so injections never interleave.</summary>
+    private readonly Action<Action> _onUi;
     private readonly KeyboardHook _hook;
     private readonly WordTracker _word = new();
     private readonly Hotkey _hotkey;
@@ -44,9 +46,10 @@ public sealed class Engine : IDisposable
 
     public event Action<string>? Notify;
 
-    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller)
+    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller, Action<Action> onUi)
     {
         _speller = speller;
+        _onUi = onUi;
         _settings = settings;
         _exceptions = exceptions;
         _dicts = dicts;
@@ -80,26 +83,33 @@ public sealed class Engine : IDisposable
                 wordLayout = _word.Layout;
             }
             _word.Reset();
-            ThreadPool.QueueUserWorkItem(_ => SafeRun(() => HandleHotkey(hk, keys, wordLayout)));
+            _onUi(() => SafeRun(() => HandleHotkey(hk, keys, wordLayout)));
             return true;
         }
 
         if (!_settings.Enabled || !_dicts.IsLoaded) return false;
 
-        if (Native.IsDown(Native.VK_CONTROL) || Native.IsDown(Native.VK_MENU) ||
-            Native.IsDown(Native.VK_LWIN) || Native.IsDown(Native.VK_RWIN))
+        // A modifier pressed on its own (Alt+Shift, Ctrl+Shift, Win — the layout switch itself) keeps the word;
+        // a real key with Ctrl/Alt/Win held is a shortcut and abandons it. Win+Space is the layout switch too.
+        bool winDown = Native.IsDown(Native.VK_LWIN) || Native.IsDown(Native.VK_RWIN);
+        if (IsModifierKey(vk)) return false;
+        if (winDown && vk == Native.VK_SPACE) return false;
+        if (Native.IsDown(Native.VK_CONTROL) || Native.IsDown(Native.VK_MENU) || winDown)
         {
             Invalidate();
             return false;
         }
 
-        if (vk is Native.VK_SHIFT or Native.VK_LSHIFT or Native.VK_RSHIFT or Native.VK_CAPITAL) return false;
-
         var hwnd = Native.GetForegroundWindow();
         var layout = Layouts.Current(hwnd);
 
-        if (!_word.IsEmpty && (hwnd != _word.Hwnd || (layout != IntPtr.Zero && layout != _word.Layout)))
-            Invalidate();
+        if (!_word.IsEmpty && hwnd != _word.Hwnd) Invalidate();
+        else if (!_word.IsEmpty && layout != IntPtr.Zero && layout != _word.Layout)
+        {
+            // the user switched the layout by hand in the middle of a word ("ult", Alt+Shift, continues typing):
+            // if the letters so far make a word in the new language, flip them right away
+            if (OnManualLayoutSwitch(hwnd, layout, vk, e.Scan)) return true;
+        }
 
         if (WordTracker.IsWordKey(vk))
         {
@@ -124,6 +134,58 @@ public sealed class Engine : IDisposable
         }
 
         // navigation, escape, delete, function keys… — word is abandoned
+        Invalidate();
+        return false;
+    }
+
+    private static bool IsModifierKey(uint vk) => vk is Native.VK_SHIFT or Native.VK_LSHIFT or Native.VK_RSHIFT
+        or Native.VK_CONTROL or Native.VK_LCONTROL or Native.VK_RCONTROL or Native.VK_MENU or Native.VK_LMENU or Native.VK_RMENU
+        or Native.VK_LWIN or Native.VK_RWIN or Native.VK_CAPITAL;
+
+    /// <summary>
+    /// Layout changed while a word is being typed. If the word reads as a known word in the new language (and not in
+    /// the old one), retype it and carry on; the current key is swallowed and re-sent after, so order is preserved.
+    /// Returns true when the key was handled here.
+    /// </summary>
+    private bool OnManualLayoutSwitch(IntPtr hwnd, IntPtr newLayout, uint vk, uint scan)
+    {
+        var oldLayout = _word.Layout;
+        var keys = _word.Snapshot();
+        int oldLang = Native.LangId(oldLayout), newLang = Native.LangId(newLayout);
+        string typed = WordTracker.Render(keys, oldLayout);
+        string flipped = WordTracker.Render(keys, newLayout);
+        var core = Corrector.StripPunctuation(typed, out _, out _);
+        var flippedCore = Corrector.StripPunctuation(flipped, out _, out _);
+
+        bool flip = _settings.AutoSwitchLayout && !_word.HasDigits && !IsExcluded(hwnd)
+                    && flippedCore.Length >= 2 && Corrector.IsWordShaped(flippedCore)
+                    && _corrector.IsKnown(newLang, flippedCore);
+        // a word in both languages ("ult"/"где", or an English word finished before switching for the Russian
+        // that follows): same collision rule as on a word boundary — context, then frequency
+        if (flip && Corrector.IsWordShaped(core) && _corrector.IsKnown(oldLang, core))
+            flip = _corrector.PreferOther(core, oldLang, flippedCore, newLang, ContextFor(hwnd), out _);
+        if (Debug) Log.Write($"manual switch '{typed}' → '{flipped}' flip={flip}");
+        if (!flip) { Invalidate(); return false; }
+
+        Injector.Replace(typed.Length, flipped);
+        _word.SetLayout(newLayout);
+        SetContext(hwnd, newLang);
+        Remember(flipped, newLayout, typed, oldLayout, 0, hwnd, wasAuto: true);
+        ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {flipped}  [manual layout switch]")));
+
+        // now the key that revealed the switch
+        if (WordTracker.IsWordKey(vk))
+        {
+            _word.Push(vk, scan, newLayout, hwnd); // injected keys are invisible to our own hook
+            Injector.PressKey((int)vk);
+            return true;
+        }
+        if (vk is Native.VK_SPACE or Native.VK_RETURN or Native.VK_TAB)
+        {
+            if (!OnWordBoundary((int)vk, hwnd)) Injector.PressKey((int)vk);
+            return true;
+        }
+        if (vk == Native.VK_BACK) { _word.Backspace(); Injector.PressKey(Native.VK_BACK); return true; }
         Invalidate();
         return false;
     }
@@ -177,41 +239,61 @@ public sealed class Engine : IDisposable
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
                 {
                     var fix = _speller.FixEither(typed, layout, alt, other, _settings.AutoSwitchLayout, ctx);
+                    _onUi(() => SafeRun(() => ApplyFix(fix, typed, layout, alt, other, hwnd, boundaryVk, hold, boundary, epoch)));
+                }));
+                return hold;
+        }
+        return false;
+    }
+
+    /// <summary>On the hook thread, so it cannot interleave with a synchronous switch of the next word.</summary>
+    private void ApplyFix(Decision fix, string typed, IntPtr layout, string alt, IntPtr other, IntPtr hwnd,
+        int boundaryVk, bool hold, string boundary, int epoch)
+    {
+                {
                     bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != typed;
 
                     // Meanwhile the user may have typed the first letters of the next word: fine, we erase and retype
                     // them too (in the new layout if we switch). Anything else — another word finished, a click,
                     // an arrow key, a different window — means we no longer know what is on screen: skip the fix.
+                    // The snapshot is re-taken right before SendInput so a keystroke landing in between is caught.
                     IReadOnlyList<TypedKey> pending = Array.Empty<TypedKey>();
                     IntPtr pendingLayout = IntPtr.Zero;
-                    bool known = Volatile.Read(ref _epoch) == epoch && _word.TryPending(hwnd, out pending, out pendingLayout);
-                    if (!known)
+                    var newLayout = fixing && fix.SwitchLayout ? other : layout;
                     {
-                        if (hold) Injector.PressKey(boundaryVk); // best effort: at least deliver the held Enter/Tab
-                        return;
+                        bool known = Volatile.Read(ref _epoch) == epoch && _word.TryPending(hwnd, out pending, out pendingLayout);
+                        if (Debug) Log.Write($"fix '{typed}' → {fix.Kind} '{fix.NewText}' known={known} pending={pending.Count} epoch={epoch}/{_epoch}");
+                        if (!known)
+                        {
+                            if (hold) Injector.PressKey(boundaryVk); // best effort: at least deliver the held Enter/Tab
+                            return;
+                        }
+                        if (pendingLayout == IntPtr.Zero) pendingLayout = layout;
+                        string pendingOld = WordTracker.Render(pending, pendingLayout);
+                        string pendingNew = fixing && fix.SwitchLayout ? WordTracker.Render(pending, other) : pendingOld;
+
+                        int backspaces; string text;
+                        if (fixing)
+                        {
+                            backspaces = typed.Length + (hold ? 0 : 1) + pendingOld.Length;
+                            text = fix.NewText + boundary + pendingNew;
+                        }
+                        else if (hold) { backspaces = pendingOld.Length; text = boundary + pendingOld; } // held Enter/Tab goes before the new letters
+                        else { backspaces = 0; text = ""; }
+
+                        if (fixing && fix.SwitchLayout) { Injector.SwitchLayout(hwnd, other); _word.SetLayout(other); }
+                        if (backspaces > 0 || text.Length > 0) Injector.Replace(backspaces, text);
                     }
-                    if (pendingLayout == IntPtr.Zero) pendingLayout = layout;
-                    string pendingOld = WordTracker.Render(pending, pendingLayout);
 
                     if (!fixing)
                     {
-                        if (hold) Injector.Replace(pendingOld.Length, boundary + pendingOld); // put the held Enter/Tab before the new letters
                         Remember(typed, layout, alt, other, boundaryVk, hwnd, wasAuto: false);
                         return;
                     }
-
-                    var newLayout = fix.SwitchLayout ? other : layout;
-                    string pendingNew = fix.SwitchLayout ? WordTracker.Render(pending, other) : pendingOld;
-                    if (fix.SwitchLayout) { Injector.SwitchLayout(hwnd, other); _word.SetLayout(other); }
                     SetContext(hwnd, Native.LangId(newLayout));
-                    int onScreen = typed.Length + (hold ? 0 : 1) + pendingOld.Length;
-                    Injector.Replace(onScreen, fix.NewText + boundary + pendingNew);
                     Remember(fix.NewText, newLayout, typed, layout, boundaryVk, hwnd, wasAuto: true);
-                    Report($"{typed} → {fix.NewText}  [{fix.Reason}]");
-                }));
-                return hold;
-        }
-        return false;
+                    ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {fix.NewText}  [{fix.Reason}]")));
+                }
     }
 
     private void Remember(string text, IntPtr layout, string alt, IntPtr altLayout, int trailingVk, IntPtr hwnd, bool wasAuto)

@@ -141,8 +141,9 @@ public sealed class SpellFixer
     private sealed record Cand(string Word, double Cost, int Rank)
     {
         public double Score => Cost + RankPenalty(Rank);
-        // 0 for the most frequent word, ~0.5 at rank 10 000, 0.85 for a word not in the list
-        private static double RankPenalty(int r) => r == int.MaxValue ? 0.85 : 0.12 * Math.Log10(r);
+        // 0 for the most frequent word, ~0.5 at rank 10 000, then steeper: a rare target needs a very cheap edit
+        private static double RankPenalty(int r) =>
+            r == int.MaxValue ? 0.85 : 0.12 * Math.Log10(r) + (r > 20_000 ? 0.3 * (Math.Log10(r) - 4.3) : 0);
     }
 
     private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason, out double score)
@@ -159,23 +160,23 @@ public sealed class SpellFixer
             cands.Add(new Cand(word, cost, _freq.Rank(lang, w)));
         }
 
-        // 1. Hunspell's own suggestions
+        // 1. Hunspell's own suggestions (single words; splits are generated below)
         foreach (var s in _dicts.Suggest(lang, norm))
-        {
-            if (s.Length == 0 || s.Contains('-')) continue;
-            if (s.Contains(' '))
+            if (s.Length > 0 && !s.Contains('-') && !s.Contains(' ')) Add(s);
+
+        // 1b. A missed space: "инужно" → "и нужно", "вобщем" → "в общем". Russian only (English compounds are
+        //     too often real words: raycast, webhook); both halves must be common, a tiny first word is typical.
+        if (lang == Dictionaries.LangRu)
+            for (int i = 1; i < norm.Length; i++)
             {
-                // "в общем" style splits: Russian only, both halves must be common words
-                if (lang != Dictionaries.LangRu) continue;
-                var parts = s.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length != 2 || string.Concat(parts) != norm) continue;
-                if (parts.Any(p => _freq.Rank(lang, p) > 20_000)) continue;
-                var w = EditCost.Normalize(s.ToLowerInvariant());
-                if (seen.Add(w)) cands.Add(new Cand(s, 1.25, parts.Max(p => _freq.Rank(lang, p))));
-                continue;
+                string a = norm[..i], b = norm[i..];
+                int ra = _freq.Rank(lang, a), rb = _freq.Rank(lang, b);
+                if (ra > 20_000 || rb > 20_000) continue;
+                if (!_dicts.Check(lang, a) || !_dicts.Check(lang, b)) continue;
+                double cost = ra <= 1_000 && rb <= 1_000 ? 0.9 : 1.25;
+                var split = a + " " + b;
+                if (seen.Add(split)) cands.Add(new Cand(split, cost, Math.Max(ra, rb)));
             }
-            Add(s);
-        }
 
         // 2. Our own: up to two cheap orthographic substitutions (Hunspell rarely finds "малако" → "молоко")
         foreach (var c in EditCost.CheapVariants(norm, lang, maxSubs: 2, limit: 400))
@@ -260,8 +261,8 @@ public static class EditCost
         char c = typed[k];
         if ((k > 0 && typed[k - 1] == c) || (k + 1 < typed.Length && typed[k + 1] == c)) return Cheap; // doubled
         if (Soft.Contains(c)) return Cheap;
-        if (IsCons(c, lang) && ((k > 0 && IsCons(typed[k - 1], lang)) || (k + 1 < typed.Length && IsCons(typed[k + 1], lang))))
-            return Neighbour; // интерестно
+        if (IsCons(c, lang) && k > 0 && IsCons(typed[k - 1], lang) && k + 1 < typed.Length && IsCons(typed[k + 1], lang))
+            return Neighbour; // an extra consonant inside a cluster: интерестно (but not вторы → воры)
         return k == typed.Length - 1 ? DeleteLast : Delete;
     }
 

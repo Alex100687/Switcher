@@ -60,3 +60,21 @@ start text='{ALTSHIFT}ghbdtn {ALTSHIFT}ult{ALTSHIFT} kt;fn ' fg=2F1928 expect=0
 done: 34 events in 1026.1 ms (delay 40 ms)
 start text='cltkfnm rfr ' fg=2F1928 expect=0
 done: 24 events in 258.2 ms (delay 0 ms)
+start text='cltkfnm rfr ltkf ' fg=B19E0 expect=0
+done: 34 events in 938.6 ms (delay 40 ms)
+start text='cltfknm rfr ltkf ' fg=B19E0 expect=0
+done: 34 events in 986.6 ms (delay 40 ms)
+start text='ghdbtn rfr ltkf ghdbtn ' fg=B19E0 expect=0
+done: 46 events in 1218.1 ms (delay 40 ms)
+start text='ghbdtn {SLEEP:300}hello wjrld ' fg=B19E0 expect=0
+done: 38 events in 1418.0 ms (delay 40 ms)
+start text='{ALTSHIFT}ghbdtn {ALTSHIFT}ult{ALTSHIFT} kt;fn ' fg=B19E0 expect=0
+done: 34 events in 999.9 ms (delay 40 ms)
+start text='cltkfnm rfr ' fg=B19E0 expect=0
+done: 24 events in 245.4 ms (delay 0 ms)
+start text='ghbdtn {SLEEP:300}hello wjrld ' fg=3C18D6 expect=0
+done: 38 events in 1512.9 ms (delay 40 ms)
+start text='ghbdtn {SLEEP:300}hello wjrld ' fg=7198E expect=0
+done: 38 events in 1486.9 ms (delay 40 ms)
+start text='ghbdtn {SLEEP:300}hello wjrld ' fg=719AA expect=0
+done: 38 events in 1472.1 ms (delay 40 ms)

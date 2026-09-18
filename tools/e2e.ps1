@@ -1,5 +1,5 @@
-﻿# End-to-end test: run LayoutFix with synthetic input accepted, type into a real TextBox, check the result.
-param([string]$Exe = "$PSScriptRoot\..\bin\Release\net8.0-windows\LayoutFix.exe", [string]$Only = "", [switch]$Debug, [switch]$NoUia)
+﻿# End-to-end test: run Switcher with synthetic input accepted, type into a real TextBox, check the result.
+param([string]$Exe = "$PSScriptRoot\..\bin\Release\net8.0-windows\Switcher.exe", [string]$Only = "", [switch]$Debug, [switch]$NoUia)
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -10,10 +10,10 @@ $t = [System.Windows.Forms.SendKeys].GetNestedType("SendMethodTypes", [Reflectio
 if ($f -and $t) { $f.SetValue($null, [Enum]::ToObject($t, 3)) } else { "WARN: cannot switch SendKeys to SendInput" }
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Get-Process LayoutFix -ErrorAction SilentlyContinue | Stop-Process -Force
-$env:LAYOUTFIX_ACCEPT_INJECTED = "1"; $env:LAYOUTFIX_NO_EXCLUDE = "1"; if ($Debug) { $env:LAYOUTFIX_DEBUG = "1" }; if ($NoUia) { $env:LAYOUTFIX_NO_UIA = "1" }
-$data = Join-Path $env:TEMP "LayoutFix_e2e"; Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $data | Out-Null
-$env:LAYOUTFIX_DATA_DIR = $data
+Get-Process Switcher -ErrorAction SilentlyContinue | Stop-Process -Force
+$env:SWITCHER_ACCEPT_INJECTED = "1"; $env:SWITCHER_NO_EXCLUDE = "1"; if ($Debug) { $env:SWITCHER_DEBUG = "1" }; if ($NoUia) { $env:SWITCHER_NO_UIA = "1" }
+$data = Join-Path $env:TEMP "Switcher_e2e"; Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $data | Out-Null
+$env:SWITCHER_DATA_DIR = $data
 '{ "Hotkey": "F9" }' | Set-Content -Path (Join-Path $data "settings.json") -Encoding UTF8
 $proc = Start-Process -FilePath (Resolve-Path $Exe) -PassThru
 # wait until dictionaries and frequency lists are loaded (the log says so)
@@ -25,7 +25,7 @@ for ($i = 0; $i -lt 60; $i++) {
 Start-Sleep -Milliseconds 500
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "LayoutFix e2e"; $form.Width = 500; $form.Height = 200; $form.TopMost = $true
+$form.Text = "Switcher e2e"; $form.Width = 500; $form.Height = 200; $form.TopMost = $true
 $form.StartPosition = 'CenterScreen'
 $tb = New-Object System.Windows.Forms.TextBox
 $tb.Multiline = $true; $tb.Dock = 'Fill'; $tb.Font = New-Object System.Drawing.Font("Consolas", 14)

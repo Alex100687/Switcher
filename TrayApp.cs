@@ -21,7 +21,7 @@ public sealed class TrayApp : ApplicationContext
     private readonly Icon _iconOff;
     private Engine? _engine;
 
-    private ToolStripMenuItem _miEnabled = null!, _miSwitch = null!, _miSpell = null!, _miBeep = null!, _miAutostart = null!, _miStatus = null!;
+    private ToolStripMenuItem _miEnabled = null!, _miSwitch = null!, _miSpell = null!, _miBeep = null!, _miLog = null!, _miAutostart = null!, _miStatus = null!;
 
     public TrayApp()
     {
@@ -41,8 +41,9 @@ public sealed class TrayApp : ApplicationContext
         };
         _icon.DoubleClick += (_, _) => ToggleEnabled();
 
-        var speller = new SpellFixer(_dicts, _freq, new Autocorrect());
-        _engine = new Engine(_settings, _exceptions, _dicts, _freq, speller);
+        var autocorrect = new Autocorrect();
+        var speller = new SpellFixer(_dicts, _freq, autocorrect, _exceptions);
+        _engine = new Engine(_settings, _exceptions, _dicts, _freq, speller, autocorrect);
         _engine.Notify += _ => { };
         try
         {
@@ -57,7 +58,7 @@ public sealed class TrayApp : ApplicationContext
 
         Task.Run(() =>
         {
-            try { _dicts.Load(); _freq.Load(); Log.Write("Frequencies loaded"); speller.WarmUp(); }
+            try { _dicts.Load(); _freq.Load(); Log.Write("Frequencies loaded"); speller.WarmUp(); _engine.Ready = true; }
             catch (Exception ex)
             {
                 Log.Write("Dictionary load failed: " + ex);
@@ -81,11 +82,13 @@ public sealed class TrayApp : ApplicationContext
         _miSwitch = Add(menu, "Автопереключение раскладки", () => { _settings.AutoSwitchLayout = !_settings.AutoSwitchLayout; Save(); });
         _miSpell = Add(menu, "Автоисправление опечаток", () => { _settings.AutoFixSpelling = !_settings.AutoFixSpelling; Save(); });
         _miBeep = Add(menu, "Звук при исправлении", () => { _settings.Beep = !_settings.Beep; Save(); });
+        _miLog = Add(menu, "Записывать замены в лог", () => { _settings.LogActions = !_settings.LogActions; Save(); });
         menu.Items.Add(new ToolStripSeparator());
         _miAutostart = Add(menu, "Запускать при входе в Windows", () => { SetAutostart(!IsAutostart()); UpdateUi(); });
         menu.Items.Add(new ToolStripSeparator());
         Add(menu, "Открыть настройки (settings.json)", () => Open(Settings.FilePath));
         Add(menu, "Открыть автозамены (autocorrect.txt)", () => { EnsureFile(Autocorrect.UserPath, "# что_набрано = на_что_заменить" + Environment.NewLine); Open(Autocorrect.UserPath); });
+        Add(menu, "Открыть отклонённые замены (blocked.txt)", () => { EnsureFile(Exceptions.BlockedPath, "# что_было = на_что_не_менять" + Environment.NewLine); Open(Exceptions.BlockedPath); });
         Add(menu, "Открыть исключения (exceptions.txt)", () => { EnsureFile(Settings.ExceptionsPath, "# слова, которые не трогать — по одному на строку\n"); Open(Settings.ExceptionsPath); });
         Add(menu, "Открыть лог", () => { EnsureFile(Settings.LogPath, ""); Open(Settings.LogPath); });
         Add(menu, "Открыть папку программы", () => Open(AppContext.BaseDirectory));
@@ -127,6 +130,7 @@ public sealed class TrayApp : ApplicationContext
         _miSwitch.Checked = _settings.AutoSwitchLayout;
         _miSpell.Checked = _settings.AutoFixSpelling;
         _miBeep.Checked = _settings.Beep;
+        _miLog.Checked = _settings.LogActions;
         _miAutostart.Checked = IsAutostart();
     }
 
@@ -136,7 +140,8 @@ public sealed class TrayApp : ApplicationContext
     {
         _icon.Visible = false;
         _engine?.Dispose();
-        try { Process.Start(new ProcessStartInfo(ExePath) { UseShellExecute = true }); }
+        // the new instance waits for this process to exit (single-instance mutex) instead of racing it
+        try { Process.Start(new ProcessStartInfo(ExePath) { UseShellExecute = true, Arguments = $"--wait-for {Environment.ProcessId}" }); }
         catch (Exception ex) { Log.Write("Restart failed: " + ex.Message); }
         ExitThread();
     }

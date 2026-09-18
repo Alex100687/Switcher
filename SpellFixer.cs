@@ -85,12 +85,14 @@ public sealed class SpellFixer
     private readonly Dictionaries _dicts;
     private readonly Frequencies _freq;
     private readonly Autocorrect _auto;
+    private readonly Exceptions _exceptions;
 
-    public SpellFixer(Dictionaries dicts, Frequencies freq, Autocorrect auto)
+    public SpellFixer(Dictionaries dicts, Frequencies freq, Autocorrect auto, Exceptions exceptions)
     {
         _dicts = dicts;
         _freq = freq;
         _auto = auto;
+        _exceptions = exceptions;
     }
 
     private static readonly bool FixDebug = Environment.GetEnvironmentVariable("SWITCHER_FIXDEBUG") == "1";
@@ -136,11 +138,12 @@ public sealed class SpellFixer
     {
         int lang = Native.LangId(hkl);
         var core = Corrector.StripPunctuation(typed, out var prefix, out var suffix);
-        if (core.Length < 3 || !Corrector.IsPureLetters(core)) return Decision.Keep;
         var lower = core.ToLowerInvariant();
 
-        if (_auto.TryGet(lower, out var explicitFix))
+        // explicit rules first — they may target hyphenated or dictionary words ("всё-же", "ихний")
+        if (core.Length > 0 && _auto.TryGet(lower, out var explicitFix) && !_exceptions.IsBlocked(lower, explicitFix))
             return Result(core, explicitFix, prefix, suffix, lang, "autocorrect", 0);
+        if (core.Length < 3 || !Corrector.IsPureLetters(core)) return Decision.Keep;
 
         if (_freq.Rank(lang, lower) <= KnownRankLimit(lang)) return Decision.Keep; // frequent colloquial word
 
@@ -177,7 +180,7 @@ public sealed class SpellFixer
         void Add(string word, double? fixedCost = null)
         {
             var w = EditCost.Normalize(word.ToLowerInvariant());
-            if (w == norm) return;
+            if (w == norm || _exceptions.IsBlocked(norm, w)) return; // the user rejected this very replacement before
             double cost = fixedCost ?? EditCost.Distance(norm, w, lang, hkl);
             if (seen.TryGetValue(w, out var idx))
             {

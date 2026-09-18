@@ -45,7 +45,12 @@ public sealed class Engine : IDisposable
     /// A pending spell fix compares it to know whether it still knows what is on screen.
     /// </summary>
     private int _epoch;
-    private void Invalidate() { Interlocked.Increment(ref _epoch); _word.Reset(); }
+    /// <summary>Anything that moves the caret also forfeits the undo of the last word: Pause must never erase text elsewhere.</summary>
+    private void Invalidate() { Interlocked.Increment(ref _epoch); _word.Reset(); lock (_lock) _last = null; }
+
+    /// <summary>Set by the host once dictionaries, frequencies and the warm-up are done; nothing is processed before.</summary>
+    public volatile bool Ready;
+    private volatile bool _disposed;
 
     /// <summary>Language of the last real words typed in the current window — the prior for ambiguous words.</summary>
     private readonly Dictionary<IntPtr, int> _context = new();
@@ -66,13 +71,13 @@ public sealed class Engine : IDisposable
 
     public event Action<string>? Notify;
 
-    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller)
+    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller, Autocorrect autocorrect)
     {
         _speller = speller;
         _settings = settings;
         _exceptions = exceptions;
         _dicts = dicts;
-        _corrector = new Corrector(dicts, exceptions, settings, freq);
+        _corrector = new Corrector(dicts, exceptions, settings, freq, autocorrect);
         _hotkey = Hotkey.Parse(settings.Hotkey);
         _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = () => { Invalidate(); _passwords.Touch(Native.GetForegroundWindow()); }, Trigger = OnTrigger };
     }
@@ -93,8 +98,9 @@ public sealed class Engine : IDisposable
 
         uint vk = e.Vk;
 
-        if (_hotkey.Matches(vk) && _settings.Enabled)
+        if (_hotkey.Matches(vk) && _settings.Enabled && Ready)
         {
+            if (_passwords.IsPasswordField(Native.GetForegroundWindow())) return true; // swallow, but never touch a password
             // snapshot on the hook thread, act on a worker thread
             var hk = Native.GetForegroundWindow();
             IReadOnlyList<TypedKey>? keys = null;
@@ -109,7 +115,7 @@ public sealed class Engine : IDisposable
             return true;
         }
 
-        if (!_settings.Enabled || !_dicts.IsLoaded) return false;
+        if (!_settings.Enabled || !Ready || _disposed) return false;
 
         // A modifier pressed on its own (Alt+Shift, Ctrl+Shift, Win — the layout switch itself) keeps the word;
         // a real key with Ctrl/Alt/Win held is a shortcut and abandons it. Win+Space is the layout switch too.
@@ -286,20 +292,61 @@ public sealed class Engine : IDisposable
                 // (no typing lag); Enter/Tab are held back, because in a chat Enter would send the unfixed word.
                 bool hold = boundaryVk != Native.VK_SPACE;
                 string boundary = boundaryVk switch { Native.VK_RETURN => "\n", Native.VK_TAB => "\t", _ => " " };
-                ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
-                {
-                    var fix = _speller.FixEither(typed, layout, alt, other, _settings.AutoSwitchLayout, ctx);
-                    RunInHook(() => ApplyFix(fix, typed, layout, alt, other, hwnd, boundaryVk, hold, boundary, epoch));
-                }));
+                var focus = Injector.FocusWindow(hwnd);
+                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, hold, boundary, epoch, ctx));
                 return hold;
         }
         return false;
     }
 
+    // ------------------------------------------------------------------ spell-fix worker: one running, one pending
+
+    private sealed record FixRequest(string Typed, IntPtr Layout, string Alt, IntPtr Other, IntPtr Hwnd, IntPtr Focus,
+        int BoundaryVk, bool Hold, string Boundary, int Epoch, int Ctx);
+
+    private FixRequest? _pendingFix;
+    private readonly SemaphoreSlim _fixSignal = new(0);
+    private Thread? _fixThread;
+
+    /// <summary>A newer request replaces an older one still waiting: its word is no longer the last one on screen anyway.</summary>
+    private void SubmitFix(FixRequest r)
+    {
+        var replaced = Interlocked.Exchange(ref _pendingFix, r);
+        if (replaced != null && replaced.Hold) Injector.PressKey(replaced.BoundaryVk); // don't swallow its Enter/Tab
+        if (_fixThread == null)
+        {
+            _fixThread = new Thread(FixWorker) { IsBackground = true, Name = "Switcher spell-fix" };
+            _fixThread.Start();
+        }
+        _fixSignal.Release();
+    }
+
+    private void FixWorker()
+    {
+        while (!_disposed)
+        {
+            _fixSignal.Wait();
+            var r = Interlocked.Exchange(ref _pendingFix, null);
+            if (r == null) continue;
+            SafeRun(() =>
+            {
+                if (Volatile.Read(ref _epoch) != r.Epoch) { if (r.Hold) Injector.PressKey(r.BoundaryVk); return; } // stale before we even started
+                var fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
+                RunInHook(() => ApplyFix(fix, r.Typed, r.Layout, r.Alt, r.Other, r.Hwnd, r.Focus, r.BoundaryVk, r.Hold, r.Boundary, r.Epoch));
+            });
+        }
+    }
+
     /// <summary>Runs inside a hook callback: every earlier key has been seen, and our SendInput is queued atomically.</summary>
-    private void ApplyFix(Decision fix, string typed, IntPtr layout, string alt, IntPtr other, IntPtr hwnd,
+    private void ApplyFix(Decision fix, string typed, IntPtr layout, string alt, IntPtr other, IntPtr hwnd, IntPtr focus,
         int boundaryVk, bool hold, string boundary, int epoch)
     {
+                // The world may have changed while we were thinking: the user switched windows or fields, turned the
+                // feature off, or the app is now excluded. Then nothing is typed anywhere — a held Enter/Tab is dropped
+                // rather than delivered to whatever has focus now.
+                if (_disposed || !_settings.Enabled || !_settings.AutoFixSpelling) return;
+                if (Native.GetForegroundWindow() != hwnd || Injector.FocusWindow(hwnd) != focus) { Log.Write("fix dropped: focus moved"); return; }
+                if (IsExcluded(hwnd) || _passwords.IsPasswordField(hwnd)) return;
                 {
                     bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != typed;
 
@@ -353,8 +400,8 @@ public sealed class Engine : IDisposable
 
     private void Remember(string text, IntPtr layout, string alt, IntPtr altLayout, int trailingVk, IntPtr hwnd, bool wasAuto)
     {
-        // After Enter the word may be gone (chat message sent) — nothing to undo.
-        var lw = trailingVk == Native.VK_RETURN
+        // After Enter the word may be gone (chat message sent), after Tab the caret is in another field — nothing to undo.
+        var lw = trailingVk is Native.VK_RETURN or Native.VK_TAB
             ? null
             : new LastWord(text, layout, alt, altLayout, trailingVk, hwnd, DateTime.UtcNow, wasAuto,
                 Corrector.StripPunctuation(wasAuto ? alt : text, out _, out _));
@@ -399,10 +446,16 @@ public sealed class Engine : IDisposable
 
         if (last.WasAuto)
         {
-            // the user disagreed with us — never touch this word again
-            var learned = last.OriginalCore;
-            ThreadPool.QueueUserWorkItem(_ => SafeRun(() => _exceptions.Add(learned)));
-            Report($"[undo] {last.Text} → {last.AltText}, '{last.OriginalCore}' добавлено в исключения");
+            // the user disagreed with us: never offer this particular replacement again; after several rejections
+            // of the same word, the word itself becomes a personal word (file I/O off the hook thread)
+            var from = last.OriginalCore;
+            var to = Corrector.StripPunctuation(last.Text, out _, out _);
+            ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
+            {
+                bool learned = _exceptions.Reject(from, to);
+                Report(learned ? $"[undo] {last.Text} → {last.AltText}; '{from}' добавлено в личный словарь после {Exceptions.UndosToLearnWord} отмен"
+                               : $"[undo] {last.Text} → {last.AltText}; замена '{from}' → '{to}' больше не предлагается");
+            }));
         }
         else
         {
@@ -446,7 +499,14 @@ public sealed class Engine : IDisposable
         catch (Exception ex) { Log.Write("Action failed: " + ex); }
     }
 
-    public void Dispose() => _hook.Dispose();
+    public void Dispose()
+    {
+        _disposed = true;
+        while (_deferred.TryDequeue(out _)) { } // a fix computed for a program that is closing must not fire
+        _pendingFix = null;
+        _fixSignal.Release();
+        _hook.Dispose();
+    }
 }
 
 /// <summary>"Ctrl+Shift+Pause" → modifiers + virtual key.</summary>

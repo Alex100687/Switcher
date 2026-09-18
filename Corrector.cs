@@ -16,13 +16,15 @@ public sealed class Corrector
     private readonly Exceptions _exceptions;
     private readonly Settings _settings;
     private readonly Frequencies _freq;
+    private readonly Autocorrect _auto;
 
-    public Corrector(Dictionaries dicts, Exceptions exceptions, Settings settings, Frequencies freq)
+    public Corrector(Dictionaries dicts, Exceptions exceptions, Settings settings, Frequencies freq, Autocorrect auto)
     {
         _dicts = dicts;
         _exceptions = exceptions;
         _settings = settings;
         _freq = freq;
+        _auto = auto;
     }
 
     /// <summary>Word-shaped and known — used to update the language context.</summary>
@@ -58,6 +60,9 @@ public sealed class Corrector
         var altCore = StripPunctuation(alt, out _, out _);
 
         if (core.Length == 0) return Decision.Keep;
+        // explicit autocorrect rules win over everything, including dictionary words ("ихний" → "их")
+        if (_settings.AutoFixSpelling && _auto.TryGet(core, out _))
+            return new Decision(ActionKind.FixSpelling, "", "autocorrect");
         if (_exceptions.Contains(core)) return Decision.Keep; // known word (whitelist / user's exceptions)
         if (IsCamelCase(core) || IsCamelCase(altCore)) return Decision.Keep; // myVar, GameObject — code, not prose
         bool allUpper = IsAllUpper(core); // abbreviation (API) — or Caps Lock in the wrong layout (GHBDTN)
@@ -67,7 +72,7 @@ public sealed class Corrector
         // Letters must stay letters: "ютуб" → ".ne," loses two letters to punctuation — not a real conversion.
         bool keepsLetters = alt.Length - altCore.Length <= typed.Length - core.Length;
         bool altIsWord = _settings.AutoSwitchLayout && altCore.Length >= minLen && IsWordShaped(altCore) && keepsLetters
-                         && IsKnown(altLang, altCore);
+                         && IsKnown(altLang, altCore) && !_exceptions.IsBlocked(core, altCore);
 
         bool coreIsWord = IsWordShaped(core);
         if (coreIsWord && IsKnown(typedLang, core))

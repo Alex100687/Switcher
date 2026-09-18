@@ -54,8 +54,11 @@ public sealed class Settings
     /// <summary>Play a short sound when a word is changed.</summary>
     public bool Beep { get; set; } = false;
 
-    /// <summary>Write every action to log.txt (useful for finding false positives).</summary>
-    public bool LogActions { get; set; } = true;
+    /// <summary>
+    /// Write every replacement (the words themselves) to log.txt — useful for finding false positives, off by default
+    /// because it is a record of what you typed. Diagnostics (errors, timings) are logged regardless.
+    /// </summary>
+    public bool LogActions { get; set; } = false;
 
     /// <summary>Hotkey: convert last word / undo. Format "Ctrl+Shift+Key", e.g. "Pause", "Ctrl+Shift+Space".</summary>
     public string Hotkey { get; set; } = "Pause";
@@ -84,7 +87,19 @@ public sealed class Settings
                 }
             }
         }
-        catch (Exception ex) { Log.Write("Settings load failed: " + ex.Message); }
+        catch (Exception ex)
+        {
+            Log.Write("Settings load failed: " + ex.Message);
+            try
+            {
+                // keep the damaged file for the user instead of silently replacing it with defaults
+                var broken = FilePath + ".broken";
+                File.Copy(FilePath, broken, overwrite: true);
+                Log.Write("Damaged settings kept as " + broken);
+            }
+            catch { }
+            return new Settings(); // in memory only; Save() would overwrite the user's file
+        }
         var def = new Settings();
         def.Save();
         return def;
@@ -96,9 +111,18 @@ public sealed class Settings
         {
             SettingsVersion = CurrentVersion;
             Directory.CreateDirectory(Dir);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOptions));
+            AtomicWrite(FilePath, JsonSerializer.Serialize(this, JsonOptions));
         }
         catch (Exception ex) { Log.Write("Settings save failed: " + ex.Message); }
+    }
+
+    /// <summary>Write via a temp file and replace, keeping the previous version as .bak — a crash mid-write never loses the file.</summary>
+    public static void AtomicWrite(string path, string content)
+    {
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, content);
+        if (File.Exists(path)) File.Replace(tmp, path, path + ".bak", ignoreMetadataErrors: true);
+        else File.Move(tmp, path);
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -115,13 +139,72 @@ public sealed class Settings
 public sealed class Exceptions
 {
     private readonly HashSet<string> _words = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>"typed → replacement" pairs the user has rejected (undo): this replacement is never offered again.</summary>
+    private readonly HashSet<string> _blocked = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _undoCount = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
+
+    public static string BlockedPath => Path.Combine(Settings.Dir, "blocked.txt");
+    /// <summary>After this many rejected corrections of the same word it is added to the personal word list outright.</summary>
+    public const int UndosToLearnWord = 3;
 
     public Exceptions()
     {
         // built-in whitelist shipped with the program (tech words etc.) + the user's own list
         LoadFile(Path.Combine(Dictionaries.DictDir, "whitelist.txt"));
         LoadFile(Settings.ExceptionsPath);
+        LoadBlocked();
+    }
+
+    private void LoadBlocked()
+    {
+        try
+        {
+            if (!File.Exists(BlockedPath)) return;
+            foreach (var line in File.ReadAllLines(BlockedPath))
+            {
+                var t = line.Trim();
+                if (t.Length == 0 || t.StartsWith('#')) continue;
+                int eq = t.IndexOf('=');
+                if (eq <= 0) continue;
+                _blocked.Add(PairKey(t[..eq].Trim(), t[(eq + 1)..].Trim()));
+            }
+        }
+        catch (Exception ex) { Log.Write("Blocked pairs load failed: " + ex.Message); }
+    }
+
+    private static string PairKey(string from, string to) => from.Trim() + "\u0001" + to.Trim();
+
+    /// <summary>Has the user rejected exactly this replacement before?</summary>
+    public bool IsBlocked(string from, string to) { lock (_lock) return _blocked.Contains(PairKey(from, to)); }
+
+    /// <summary>
+    /// The user undid "from → to". Remember the pair; after <see cref="UndosToLearnWord"/> rejections of the same word
+    /// (any replacement) the word itself goes to the personal list. Returns true when the word was learned.
+    /// </summary>
+    public bool Reject(string from, string to)
+    {
+        from = from.Trim().ToLowerInvariant(); to = to.Trim().ToLowerInvariant();
+        if (from.Length == 0 || to.Length == 0) return false;
+        bool learned = false;
+        lock (_lock)
+        {
+            if (_blocked.Add(PairKey(from, to)))
+            {
+                try
+                {
+                    Directory.CreateDirectory(Settings.Dir);
+                    if (!File.Exists(BlockedPath))
+                        File.WriteAllText(BlockedPath, "# Отклонённые автозамены: что_было = на_что_не_менять (по одной на строку)" + Environment.NewLine);
+                    File.AppendAllText(BlockedPath, from + " = " + to + Environment.NewLine);
+                }
+                catch (Exception ex) { Log.Write("Blocked pairs save failed: " + ex.Message); }
+            }
+            _undoCount[from] = _undoCount.TryGetValue(from, out var n) ? n + 1 : 1;
+            learned = _undoCount[from] >= UndosToLearnWord && !_words.Contains(from);
+        }
+        if (learned) Add(from);
+        return learned;
     }
 
     private void LoadFile(string path)

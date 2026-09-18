@@ -52,7 +52,7 @@ public static class Injector
                     if (Diag) Log.Write($"  injector: SendInput({batch.Length} events) took {sw.Elapsed.TotalMilliseconds:0.0} ms");
                 }
                 catch (Exception ex) { Log.Write("SendInput failed: " + ex.Message); }
-                finally { done?.Set(); }
+                finally { try { done?.Set(); } catch (ObjectDisposedException) { } }
             }
         }) { IsBackground = true, Name = "Switcher injector" };
         t.Start();
@@ -98,6 +98,7 @@ public static class Injector
     private static void Send(List<Native.INPUT> list)
     {
         if (list.Count == 0) return;
+        ReleaseHeldModifiers(list);
         var arr = list.ToArray();
         if (!KeyboardHook.InCallback) { _queue.Add((arr, null)); return; }
 
@@ -106,7 +107,7 @@ public static class Injector
         // crawl (~5 ms/event: each injected event wants a hook callback on the thread that is busy calling
         // SendInput). So the injector thread sends while we pump the sent messages — our own callbacks for the
         // injected events — until it is done. Typically ~1 ms for a whole word.
-        using var done = new ManualResetEvent(false);
+        var done = new ManualResetEvent(false); // not disposed: the injector may finish after our wait gave up
         _queue.Add((arr, done));
         var handles = new[] { done.SafeWaitHandle.DangerousGetHandle() };
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -116,6 +117,23 @@ public static class Injector
             Native.MsgWaitForMultipleObjectsEx(1, handles, 20, Native.QS_SENDMESSAGE, Native.MWMO_INPUTAVAILABLE);
             if (sw.ElapsedMilliseconds > 250) { Log.Write("injection did not finish in 250 ms — giving up the wait"); break; }
         }
+    }
+
+    /// <summary>
+    /// If the user is physically holding Ctrl/Alt/Win/Shift (a hotkey like Ctrl+Shift+Space, or just fast typing), our
+    /// Backspaces would become Ctrl+Backspace (delete a word) and Enter would become Shift+Enter. Wrap the batch in
+    /// key-ups of the held modifiers and key-downs afterwards so the app sees plain keys and the user's state is restored.
+    /// </summary>
+    private static void ReleaseHeldModifiers(List<Native.INPUT> list)
+    {
+        var held = new List<int>();
+        foreach (var vk in new[] { Native.VK_LCONTROL, Native.VK_RCONTROL, Native.VK_LMENU, Native.VK_RMENU, Native.VK_LWIN, Native.VK_RWIN, Native.VK_LSHIFT, Native.VK_RSHIFT })
+            if (Native.IsDown(vk)) held.Add(vk);
+        if (held.Count == 0) return;
+        var prefix = new List<Native.INPUT>();
+        foreach (var vk in held) prefix.Add(Key((ushort)vk, (ushort)Native.MapVirtualKeyEx((uint)vk, 0, IntPtr.Zero), Native.KEYEVENTF_KEYUP));
+        list.InsertRange(0, prefix);
+        foreach (var vk in held) list.Add(Key((ushort)vk, (ushort)Native.MapVirtualKeyEx((uint)vk, 0, IntPtr.Zero), 0));
     }
 
     private static void AddVk(List<Native.INPUT> list, int vk)

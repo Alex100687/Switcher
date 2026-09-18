@@ -11,6 +11,13 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--test")
             return SelfTest.Run(args.Skip(1).ToArray());
 
+        // "--wait-for <pid>": started by Restart — let the previous instance release the mutex first
+        int w = Array.IndexOf(args, "--wait-for");
+        if (w >= 0 && w + 1 < args.Length && int.TryParse(args[w + 1], out int pid))
+        {
+            try { using var prev = System.Diagnostics.Process.GetProcessById(pid); prev.WaitForExit(5000); } catch { }
+        }
+
         using var mutex = new Mutex(true, @"Local\Switcher_SingleInstance", out bool created);
         if (!created) return 0; // already running
         Settings.MigrateFromLayoutFix();
@@ -48,8 +55,9 @@ internal static class SelfTest
         dicts.Load();
         var freq = new Frequencies(); freq.Load();
         Console.WriteLine($"dictionaries: {sw.ElapsedMilliseconds} ms");
-        var corrector = new Corrector(dicts, exceptions, settings, freq);
-        var speller = new SpellFixer(dicts, freq, new Autocorrect());
+        var autocorrect = new Autocorrect();
+        var corrector = new Corrector(dicts, exceptions, settings, freq, autocorrect);
+        var speller = new SpellFixer(dicts, freq, autocorrect, exceptions);
 
         var layouts = Layouts.Installed();
         Console.WriteLine("layouts: " + string.Join(", ", layouts.Select(h => $"{Layouts.Name(h)} ({(long)h:X8})")));

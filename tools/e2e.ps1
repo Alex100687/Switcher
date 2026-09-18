@@ -10,7 +10,10 @@ $t = [System.Windows.Forms.SendKeys].GetNestedType("SendMethodTypes", [Reflectio
 if ($f -and $t) { $f.SetValue($null, [Enum]::ToObject($t, 3)) } else { "WARN: cannot switch SendKeys to SendInput" }
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Get-Process Switcher -ErrorAction SilentlyContinue | Stop-Process -Force
+# A running Switcher would double every correction (two hooks), so it is stopped for the test — and started again at the end.
+$running = @(Get-Process Switcher, LayoutFix -ErrorAction SilentlyContinue | ForEach-Object { $_.Path } | Where-Object { $_ })
+Get-Process Switcher, LayoutFix -ErrorAction SilentlyContinue | Stop-Process -Force
+$script:failures = 0
 $env:SWITCHER_ACCEPT_INJECTED = "1"; $env:SWITCHER_NO_EXCLUDE = "1"; if ($Debug) { $env:SWITCHER_DEBUG = "1" }; if ($NoUia) { $env:SWITCHER_NO_UIA = "1" }
 $data = Join-Path $env:TEMP "Switcher_e2e"; Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $data | Out-Null
 $env:SWITCHER_DATA_DIR = $data
@@ -57,7 +60,7 @@ function Step($name, $lang, $keys, $expected) {
     for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     $got = $tb.Text
     $layoutNow = [System.Windows.Forms.InputLanguage]::CurrentInputLanguage.Culture.Name
-    $ok = if ($got -eq $expected) { "OK  " } else { "FAIL" }
+    $ok = if ($got -eq $expected) { "OK  " } else { $script:failures++; "FAIL" }
     "{0} {1,-22} typed='{2}' got='{3}' expected='{4}' layout={5}" -f $ok, $name, $keys, $got, $expected, $layoutNow
 }
 
@@ -84,7 +87,7 @@ function Burst($name, $lang, $first, $rest, $accept) {
     [System.Windows.Forms.SendKeys]::SendWait($rest)
     for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     $got = $tb.Text
-    if ($accept -contains $got) { "OK   {0,-22} got='{1}'" -f $name, $got } else { "FAIL {0,-22} got='{1}' expected one of: {2}" -f $name, $got, ($accept -join " | ") }
+    if ($accept -contains $got) { "OK   {0,-22} got='{1}'" -f $name, $got } else { $script:failures++; "FAIL {0,-22} got='{1}' expected one of: {2}" -f $name, $got, ($accept -join " | ") }
 }
 # after our layout switch the same physical keys F,R,L,T,K,F now produce Cyrillic — SendKeys must be given the Cyrillic
 Burst "fix+switch, next word" $en "cltfknm r" "ак дела " @("сделать как дела ")
@@ -100,7 +103,7 @@ function Human($name, $lang, $keys, $expected, $delayMs = 40) {
     while (-not $p.HasExited) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 5 }
     for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     $got = $tb.Text
-    if ($got -eq $expected) { "OK   {0,-22} got='{1}'" -f $name, $got } else { "FAIL {0,-22} got='{1}' expected='{2}'" -f $name, $got, $expected }
+    if ($got -eq $expected) { "OK   {0,-22} got='{1}'" -f $name, $got } else { $script:failures++; "FAIL {0,-22} got='{1}' expected='{2}'" -f $name, $got, $expected }
 }
 # a fast typist: 25 keys/s, no pauses between words (keys given as US-layout letters)
 Human "fast typist switch"    $en "cltkfnm rfr ltkf " "сделать как дела "
@@ -122,14 +125,14 @@ if ((-not $Only -or "manual switch" -like "*$Only*") -and (Ensure-Foreground "ma
     [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $ru; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait(" лежат ")
     for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
-    if ($tb.Text -eq "где лежат ") { "OK   manual switch         got='$($tb.Text)'" } else { "FAIL manual switch         got='$($tb.Text)' expected='где лежат '" }
+    if ($tb.Text -eq "где лежат ") { "OK   manual switch         got='$($tb.Text)'" } else { $script:failures++; "FAIL manual switch         got='$($tb.Text)' expected='где лежат '" }
 }
 # password box: never rewritten
 if ((-not $Only -or "password" -like "*$Only*") -and (Ensure-Foreground "password keep")) {
     $pw.Clear(); $pw.Focus(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $en; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait("ghbdtn ")
     for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
-    if ($pw.Text -eq "ghbdtn ") { "OK   password keep         got='$($pw.Text)'" } else { "FAIL password keep         got='$($pw.Text)' expected='ghbdtn '" }
+    if ($pw.Text -eq "ghbdtn ") { "OK   password keep         got='$($pw.Text)'" } else { $script:failures++; "FAIL password keep         got='$($pw.Text)' expected='ghbdtn '" }
     $tb.Focus(); [System.Windows.Forms.Application]::DoEvents()
 }
 Step "missed space"       $ru "инужно "        "и нужно "
@@ -142,9 +145,13 @@ Step "hotkey mid-word"   $en "ghbdtn{F9}"     "привет"
 Step "hotkey last word"  $en "hello {F9}"     "руддщ "
 Step "auto + undo"       $en "ghbdtn {F9}"    "ghbdtn "
 Step "learned exception" $en "ghbdtn "        "ghbdtn "
-"exceptions.txt: " + ((Get-Content (Join-Path $data "exceptions.txt") -Encoding UTF8) -join ", ")
+"blocked.txt: " + ((Get-Content (Join-Path $data "blocked.txt") -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -notlike "#*" }) -join ", ")
 
 $form.Close()
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+foreach ($exe in $running | Select-Object -Unique) { if (Test-Path $exe) { Start-Process $exe | Out-Null; "restarted $exe" } }
 "--- log tail ---"
 Get-Content (Join-Path $data "log.txt") -Encoding UTF8 -Tail 80
+"RESULT: $script:failures failed"
+exit ([int]($script:failures -gt 0))

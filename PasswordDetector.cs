@@ -59,19 +59,31 @@ public sealed class PasswordDetector
             if (!stale || _busy) return;
             _busy = true;
             _pending = focus;
+            _pendingSince = DateTime.UtcNow;
             _pendingCaret = caret;
             _pendingHasCaret = hasCaret;
         }
         _request.Set();
     }
 
-    /// <summary>Last known answer for the focused control (never blocks).</summary>
+    /// <summary>
+    /// Should we refrain from rewriting text here? True for a password box, and also while the very first UIA answer
+    /// for this control is still pending (up to <see cref="PendingGrace"/>) — better to miss one correction than to
+    /// rewrite a password. Never blocks.
+    /// </summary>
     public bool IsPasswordField(IntPtr foreground)
     {
         var focus = Injector.FocusWindow(foreground);
         if (HasPasswordStyle(focus)) return true;
-        lock (_lock) return focus == _cachedFocus && _cachedValue;
+        lock (_lock)
+        {
+            if (focus == _cachedFocus) return _cachedValue;
+            // no answer for this control yet: treat as unsafe only while a fresh query can still be expected
+            return !Disabled && _busy && _pending == focus && DateTime.UtcNow - _pendingSince < PendingGrace;
+        }
     }
+    private static readonly TimeSpan PendingGrace = TimeSpan.FromMilliseconds(400);
+    private DateTime _pendingSince;
 
     private static bool HasPasswordStyle(IntPtr focus)
     {

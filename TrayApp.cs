@@ -10,11 +10,7 @@ using System.Windows.Forms;
 
 using Microsoft.Win32;
 
-
-
 namespace Switcher;
-
-
 
 public sealed class TrayApp : ApplicationContext
 
@@ -23,8 +19,6 @@ public sealed class TrayApp : ApplicationContext
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
     private const string RunName = "Switcher";
-
-
 
     private readonly Settings _settings;
 
@@ -42,11 +36,7 @@ public sealed class TrayApp : ApplicationContext
 
     private Engine? _engine;
 
-
-
     private ToolStripMenuItem _miEnabled = null!, _miSwitch = null!, _miSpell = null!, _miBeep = null!, _miAutostart = null!, _miStatus = null!;
-
-
 
     public TrayApp()
 
@@ -58,13 +48,9 @@ public sealed class TrayApp : ApplicationContext
 
         _exceptions = new Exceptions();
 
-
-
         _iconOn = MakeIcon(Color.FromArgb(0x2B, 0x8A, 0x3E));
 
         _iconOff = MakeIcon(Color.FromArgb(0x80, 0x80, 0x80));
-
-
 
         _icon = new NotifyIcon
 
@@ -81,8 +67,6 @@ public sealed class TrayApp : ApplicationContext
         };
 
         _icon.DoubleClick += (_, _) => ToggleEnabled();
-
-
 
         var speller = new SpellFixer(_dicts, _freq, new Autocorrect());
 
@@ -110,8 +94,6 @@ public sealed class TrayApp : ApplicationContext
 
         }
 
-
-
         Task.Run(() =>
 
         {
@@ -134,13 +116,9 @@ public sealed class TrayApp : ApplicationContext
 
         });
 
-
-
         UpdateUi();
 
     }
-
-
 
     private ContextMenuStrip BuildMenu()
 
@@ -153,8 +131,6 @@ public sealed class TrayApp : ApplicationContext
         menu.Items.Add(_miStatus);
 
         menu.Items.Add(new ToolStripSeparator());
-
-
 
         _miEnabled = Add(menu, "Включено", ToggleEnabled);
 
@@ -190,8 +166,6 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     private static ToolStripMenuItem Add(ContextMenuStrip menu, string text, Action onClick)
 
     {
@@ -206,8 +180,6 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     private void ToggleEnabled()
 
     {
@@ -218,8 +190,6 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     private void Save()
 
     {
@@ -229,8 +199,6 @@ public sealed class TrayApp : ApplicationContext
         UpdateUi();
 
     }
-
-
 
     private void UpdateUi()
 
@@ -260,11 +228,7 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     private static string Version => typeof(TrayApp).Assembly.GetName().Version?.ToString(3) ?? "1.0";
-
-
 
     private void Restart()
 
@@ -282,15 +246,9 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     // ------------------------------------------------------------------ autostart
 
-
-
     public static string ExePath => Environment.ProcessPath ?? Application.ExecutablePath;
-
-
 
     public static bool IsAutostart()
 
@@ -303,8 +261,6 @@ public sealed class TrayApp : ApplicationContext
         return v != null && v.Trim('"').Equals(ExePath, StringComparison.OrdinalIgnoreCase);
 
     }
-
-
 
     public static void SetAutostart(bool enable)
 
@@ -319,11 +275,7 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     // ------------------------------------------------------------------ helpers
-
-
 
     private static void Open(string path)
 
@@ -334,8 +286,6 @@ public sealed class TrayApp : ApplicationContext
         catch (Exception ex) { Log.Write("Open failed: " + ex.Message); }
 
     }
-
-
 
     private static void EnsureFile(string path, string initial)
 
@@ -355,8 +305,6 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     private void BeginInvokeUi(Action a)
 
     {
@@ -372,8 +320,6 @@ public sealed class TrayApp : ApplicationContext
         if (!strip.IsHandleCreated) _ = strip.Handle; // force handle creation
 
     }
-
-
 
     /// <summary>Draw a small "Яa" badge — no external icon file needed.</summary>
 
@@ -413,8 +359,6 @@ public sealed class TrayApp : ApplicationContext
 
     }
 
-
-
     private static GraphicsPath RoundedRect(Rectangle r, int radius)
 
     {
@@ -436,8 +380,6 @@ public sealed class TrayApp : ApplicationContext
         return p;
 
     }
-
-
 
     protected override void Dispose(bool disposing)
 

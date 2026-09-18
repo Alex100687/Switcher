@@ -1,7 +1,5 @@
 namespace Switcher;
 
-
-
 /// <summary>Word-form frequency ranks (1 = most frequent) per language, from dict/{ru,en}_freq.txt.</summary>
 
 public sealed class Frequencies
@@ -9,8 +7,6 @@ public sealed class Frequencies
 {
 
     private readonly Dictionary<int, Dictionary<string, int>> _ranks = new();
-
-
 
     public void Load()
 
@@ -21,8 +17,6 @@ public sealed class Frequencies
         LoadOne(Dictionaries.LangEn, Path.Combine(Dictionaries.DictDir, "en_freq.txt"));
 
     }
-
-
 
     private void LoadOne(int lang, string path)
 
@@ -58,13 +52,9 @@ public sealed class Frequencies
 
     }
 
-
-
     /// <summary>Rank of the word (case-insensitive, ё=е) or int.MaxValue if unknown.</summary>
 
     public int Rank(int lang, string word) => RankNormalized(lang, word.ToLowerInvariant().Replace('ё', 'е'));
-
-
 
     /// <summary>Same, for a word that is already lowercase with ё→е (hot path of candidate generation).</summary>
 
@@ -80,8 +70,6 @@ public sealed class Frequencies
 
 }
 
-
-
 /// <summary>Explicit "wrong = right" replacements: built-in dict/autocorrect.txt + user's %AppData%\Switcher\autocorrect.txt.</summary>
 
 public sealed class Autocorrect
@@ -90,11 +78,7 @@ public sealed class Autocorrect
 
     private readonly Dictionary<string, string> _map = new(StringComparer.OrdinalIgnoreCase);
 
-
-
     public static string UserPath => Path.Combine(Settings.Dir, "autocorrect.txt");
-
-
 
     public Autocorrect()
 
@@ -105,8 +89,6 @@ public sealed class Autocorrect
         LoadFile(UserPath);
 
     }
-
-
 
     private void LoadFile(string path)
 
@@ -144,13 +126,9 @@ public sealed class Autocorrect
 
     }
 
-
-
     public bool TryGet(string word, out string replacement) => _map.TryGetValue(word, out replacement!);
 
 }
-
-
 
 /// <summary>
 
@@ -172,8 +150,6 @@ public sealed class SpellFixer
 
     private readonly Autocorrect _auto;
 
-
-
     public SpellFixer(Dictionaries dicts, Frequencies freq, Autocorrect auto)
 
     {
@@ -186,17 +162,11 @@ public sealed class SpellFixer
 
     }
 
-
-
     private static readonly bool FixDebug = Environment.GetEnvironmentVariable("SWITCHER_FIXDEBUG") == "1";
-
-
 
     /// <summary>Typed words at least this frequent are treated as real (colloquial) words and left alone.</summary>
 
     public static int KnownRankLimit(int lang) => lang == Dictionaries.LangRu ? 10_000 : 5_000;
-
-
 
     /// <summary>
 
@@ -242,8 +212,6 @@ public sealed class SpellFixer
 
     }
 
-
-
     /// <summary>JIT and caches: run once after loading so the first real correction is not the slow one.</summary>
 
     public void WarmUp()
@@ -264,8 +232,6 @@ public sealed class SpellFixer
 
     }
 
-
-
     public Decision Fix(string typed, IntPtr hkl)
 
     {
@@ -278,17 +244,11 @@ public sealed class SpellFixer
 
         var lower = core.ToLowerInvariant();
 
-
-
         if (_auto.TryGet(lower, out var explicitFix))
 
             return Result(core, explicitFix, prefix, suffix, lang, "autocorrect", 0);
 
-
-
         if (_freq.Rank(lang, lower) <= KnownRankLimit(lang)) return Decision.Keep; // frequent colloquial word
-
-
 
         var norm = EditCost.Normalize(lower);
 
@@ -302,8 +262,6 @@ public sealed class SpellFixer
 
     }
 
-
-
     private static Decision Result(string core, string fix, string prefix, string suffix, int lang, string reason, double score)
 
     {
@@ -315,8 +273,6 @@ public sealed class SpellFixer
         return new Decision(ActionKind.FixSpelling, prefix + cased + suffix, $"'{core}' → '{cased}' ({Corrector.LangName(lang)}, {reason})", score);
 
     }
-
-
 
     private sealed record Cand(string Word, double Cost, int Rank)
 
@@ -332,8 +288,6 @@ public sealed class SpellFixer
 
     }
 
-
-
     private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason, out double score)
 
     {
@@ -343,8 +297,6 @@ public sealed class SpellFixer
         var seen = new Dictionary<string, int>(StringComparer.Ordinal); // normalized word → index in cands
 
         var cands = new List<Cand>();
-
-
 
         // the same word can be reached by several paths — keep the cheapest
 
@@ -374,15 +326,11 @@ public sealed class SpellFixer
 
         }
 
-
-
         // generated variants are accepted only if they are in the frequency list anyway, and that lookup is ~1000×
 
         // cheaper than Hunspell — so it goes first
 
         bool IsWord(string v) => _freq.RankNormalized(lang, v) != int.MaxValue && _dicts.Check(lang, v);
-
-
 
         // 1b. A missed space: "инужно" → "и нужно", "вобщем" → "в общем". Russian only (English compounds are
 
@@ -410,15 +358,11 @@ public sealed class SpellFixer
 
             }
 
-
-
         // 2. Our own: up to two cheap orthographic substitutions (Hunspell rarely finds "малако" → "молоко")
 
         foreach (var c in EditCost.CheapVariants(norm, lang, maxSubs: 2, limit: 400))
 
             if (IsWord(c)) Add(c);
-
-
 
         // 3. Every single edit (Hunspell caps its list at ~15 and misses some), then two edits where the first one
 
@@ -472,8 +416,6 @@ public sealed class SpellFixer
 
         }
 
-
-
         if (FixDebug) Log.Write($"  fast stages: {cands.Count} cands, best {(cands.Count > 0 ? cands.Min(c => c.Score).ToString("0.00") : "-")}: " + string.Join(", ", cands.OrderBy(c => c.Score).Take(5).Select(c => $"{c.Word}({c.Cost:0.00}/{c.Rank})")));
 
         // 4. Hunspell's own suggestions (REP table: phonetic spellings, n-gram guesses) — slow (30–100 ms),
@@ -486,15 +428,11 @@ public sealed class SpellFixer
 
                 if (s.Length > 0 && !s.Contains('-') && !s.Contains(' ')) Add(s);
 
-
-
         if (cands.Count == 0) return null;
 
         cands.Sort((a, b) => a.Score.CompareTo(b.Score));
 
         var best = cands[0];
-
-
 
         int len = norm.Length;
 
@@ -514,8 +452,6 @@ public sealed class SpellFixer
 
         if (capitalized && best.Rank > 10_000) return null;            // probably a name we don't know (Вельск ≠ Вольск)
 
-
-
         reason = $"cost {best.Cost:0.00}, rank {best.Rank}";
 
         score = best.Score;
@@ -525,8 +461,6 @@ public sealed class SpellFixer
     }
 
 }
-
-
 
 /// <summary>Weighted edit distance tuned for spelling errors, plus generation of cheap-substitution variants.</summary>
 
@@ -548,8 +482,6 @@ public static class EditCost
 
     public const double Full = 1.0;
 
-
-
     private static readonly Dictionary<char, string> CheapRu = Build(
 
         "ао", "еи", "иы", "еэ", "ея", "ое", "ую", "ая", "зс", "дт", "бп", "вф", "гк", "жш", "чш", "щш", "хг", "цс", "ьъ", "йи");
@@ -558,15 +490,11 @@ public static class EditCost
 
         "ae", "ei", "ai", "ou", "sz", "cs", "ck", "yi", "ao", "ui", "gj", "fv");
 
-
-
     private const string ConsRu = "бвгджзйклмнпрстфхцчшщ";
 
     private const string ConsEn = "bcdfghjklmnpqrstvwxz";
 
     private const string Soft = "ьъ";
-
-
 
     private static Dictionary<char, string> Build(params string[] pairs)
 
@@ -586,19 +514,13 @@ public static class EditCost
 
     }
 
-
-
     public static string Normalize(string s) => s.Replace('ё', 'е');
-
-
 
     private static bool IsCons(char c, int lang) => (lang == Dictionaries.LangRu ? ConsRu : ConsEn).Contains(c);
 
     private static bool IsCheapPair(char a, char b, int lang) =>
 
         (lang == Dictionaries.LangRu ? CheapRu : CheapEn).TryGetValue(a, out var s) && s.Contains(b);
-
-
 
     private static double Sub(char a, char b, int lang, IntPtr hkl)
 
@@ -613,8 +535,6 @@ public static class EditCost
         return Full;
 
     }
-
-
 
     /// <summary>Cost of the letter cand[k] missing from the typed word.</summary>
 
@@ -636,8 +556,6 @@ public static class EditCost
 
     }
 
-
-
     /// <summary>Cost of the extra letter typed[k].</summary>
 
     private static double Del(string typed, int k, int lang)
@@ -657,8 +575,6 @@ public static class EditCost
         return k == typed.Length - 1 ? DeleteLast : Delete;
 
     }
-
-
 
     public static double Distance(string typed, string cand, int lang, IntPtr hkl)
 
@@ -696,13 +612,9 @@ public static class EditCost
 
     }
 
-
-
     private const string AlphaRu = "абвгдежзийклмнопрстуфхцчшщъыьэюя";
 
     private const string AlphaEn = "abcdefghijklmnopqrstuvwxyz";
-
-
 
     /// <summary>Every string one edit away: deletions, transpositions, substitutions, insertions.</summary>
 
@@ -734,8 +646,6 @@ public static class EditCost
 
     }
 
-
-
     /// <summary>The first of two edits: only the kinds of slip a fast typist actually makes, with their cost.</summary>
 
     public static IEnumerable<(string word, double cost)> LikelySlips(string w, int lang, IntPtr hkl)
@@ -764,8 +674,6 @@ public static class EditCost
 
     }
 
-
-
     /// <summary>All words reachable from <paramref name="word"/> by 1..maxSubs cheap substitutions.</summary>
 
     public static IEnumerable<string> CheapVariants(string word, int lang, int maxSubs, int limit)
@@ -777,8 +685,6 @@ public static class EditCost
         var positions = new List<int>();
 
         for (int i = 0; i < word.Length; i++) if (table.ContainsKey(word[i])) positions.Add(i);
-
-
 
         int produced = 0;
 

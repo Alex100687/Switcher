@@ -1,0 +1,63 @@
+# russian correct
+привет
+проект
+москва
+ещё
+еще
+сделать
+# russian typos
+# ru slang / short
+лол
+хз
+ща
+кек
+пж
+ыыы
+да
+ок
+# english typed in RU layout
+# tech words
+async
+await
+foreach
+elif
+config
+json
+regex
+struct
+enum
+nullable
+prefab
+shader
+mesh
+vertex
+sprite
+gameobject
+rigidbody
+collider
+raycast
+commit
+rebase
+repo
+backend
+frontend
+localhost
+dotnet
+python
+numpy
+github
+discord
+telegram
+youtube
+unity
+csproj
+nuget
+hunspell
+winget
+todo
+readme
+changelog
+webhook
+oauth
+plugin
+tokenizer

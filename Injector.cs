@@ -1,10 +1,6 @@
 using System.Runtime.InteropServices;
 
-
-
 namespace Switcher;
-
-
 
 /// <summary>Sends synthetic keystrokes and layout-change requests to the foreground window.</summary>
 
@@ -21,8 +17,6 @@ public static class Injector
     public static readonly IntPtr TriggerSignature = (IntPtr)0x4C46_5452; // "LFTR"
 
     private const ushort TriggerVk = 0xE8; // unassigned virtual key; the hook swallows it anyway
-
-
 
     /// <summary>
 
@@ -54,13 +48,9 @@ public static class Injector
 
     }
 
-
-
     private static readonly int InputSize = Marshal.SizeOf<Native.INPUT>();
 
     private static readonly bool Diag = Environment.GetEnvironmentVariable("SWITCHER_DEBUG") == "1";
-
-
 
     // SendInput returns only after the input thread has run the low-level hooks for the injected events. If the
 
@@ -73,8 +63,6 @@ public static class Injector
     private static readonly System.Collections.Concurrent.BlockingCollection<(Native.INPUT[] batch, ManualResetEvent? done)> _queue = new();
 
     private static readonly Thread _thread = StartThread();
-
-
 
     private static Thread StartThread()
 
@@ -118,8 +106,6 @@ public static class Injector
 
     }
 
-
-
     /// <summary>Ask the target window to switch to the given keyboard layout.</summary>
 
     public static void SwitchLayout(IntPtr hwnd, IntPtr hkl)
@@ -137,8 +123,6 @@ public static class Injector
             Native.PostMessage(hwnd, Native.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
 
     }
-
-
 
     /// <summary>
 
@@ -170,8 +154,6 @@ public static class Injector
 
     public static void PressKey(int vk) => Send(new List<Native.INPUT>(2).Also(l => AddVk(l, vk)));
 
-
-
     private static void Send(List<Native.INPUT> list)
 
     {
@@ -181,8 +163,6 @@ public static class Injector
         var arr = list.ToArray();
 
         if (!KeyboardHook.InCallback) { _queue.Add((arr, null)); return; }
-
-
 
         // Inside a hardware key's hook callback the input thread is blocked on us, so whatever is injected now
 
@@ -216,8 +196,6 @@ public static class Injector
 
     }
 
-
-
     private static void AddVk(List<Native.INPUT> list, int vk)
 
     {
@@ -230,8 +208,6 @@ public static class Injector
 
     }
 
-
-
     private static void AddUnicode(List<Native.INPUT> list, char ch)
 
     {
@@ -241,8 +217,6 @@ public static class Injector
         list.Add(Key(0, ch, Native.KEYEVENTF_UNICODE | Native.KEYEVENTF_KEYUP));
 
     }
-
-
 
     private static Native.INPUT Key(ushort vk, ushort scan, uint flags) => new()
 
@@ -259,8 +233,6 @@ public static class Injector
         }
 
     };
-
-
 
     /// <summary>
 
@@ -306,13 +278,9 @@ public static class Injector
 
     }
 
-
-
     private static void Down(List<Native.INPUT> l, int vk) => l.Add(Key((ushort)vk, (ushort)Native.MapVirtualKeyEx((uint)vk, 0, IntPtr.Zero), 0));
 
     private static void Up(List<Native.INPUT> l, int vk) => l.Add(Key((ushort)vk, (ushort)Native.MapVirtualKeyEx((uint)vk, 0, IntPtr.Zero), Native.KEYEVENTF_KEYUP));
-
-
 
     /// <summary>The window that actually has keyboard focus inside the foreground window's thread (falls back to hwnd).</summary>
 
@@ -331,8 +299,6 @@ public static class Injector
         return hwnd;
 
     }
-
-
 
     private static List<T> Also<T>(this List<T> list, Action<List<T>> f) { f(list); return list; }
 

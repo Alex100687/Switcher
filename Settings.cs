@@ -2,11 +2,7 @@ using System.Text.Json;
 
 using System.Text.Json.Serialization;
 
-
-
 namespace Switcher;
-
-
 
 public sealed class Settings
 
@@ -38,45 +34,31 @@ public sealed class Settings
 
     public static string LogPath => Path.Combine(Dir, "log.txt");
 
-
-
     /// <summary>Bumped when a default changes; old files get the affected fields migrated in <see cref="Load"/>.</summary>
 
     public int SettingsVersion { get; set; } // 0 = file written before versioning
 
     public const int CurrentVersion = 2;
 
-
-
     /// <summary>Master switch.</summary>
 
     public bool Enabled { get; set; } = true;
-
-
 
     /// <summary>Automatically switch layout and retype a word typed in the wrong layout.</summary>
 
     public bool AutoSwitchLayout { get; set; } = true;
 
-
-
     /// <summary>Automatically fix single-edit typos in words that exist in no dictionary.</summary>
 
     public bool AutoFixSpelling { get; set; } = true;
-
-
 
     /// <summary>Shortest word (letters only) that may be auto-switched.</summary>
 
     public int MinWordLength { get; set; } = 2;
 
-
-
     /// <summary>Shortest word that may be spell-fixed.</summary>
 
     public int MinSpellFixLength { get; set; } = 3;
-
-
 
     /// <summary>
 
@@ -88,25 +70,17 @@ public sealed class Settings
 
     public bool ToggleHotkeyIfIgnored { get; set; } = false;
 
-
-
     /// <summary>Play a short sound when a word is changed.</summary>
 
     public bool Beep { get; set; } = false;
-
-
 
     /// <summary>Write every action to log.txt (useful for finding false positives).</summary>
 
     public bool LogActions { get; set; } = true;
 
-
-
     /// <summary>Hotkey: convert last word / undo. Format "Ctrl+Shift+Key", e.g. "Pause", "Ctrl+Shift+Space".</summary>
 
     public string Hotkey { get; set; } = "Pause";
-
-
 
     /// <summary>Process names (without .exe) where the program does nothing.</summary>
 
@@ -123,8 +97,6 @@ public sealed class Settings
         "mstsc", "vmware", "VirtualBoxVM",
 
     };
-
-
 
     public static Settings Load()
 
@@ -166,8 +138,6 @@ public sealed class Settings
 
     }
 
-
-
     public void Save()
 
     {
@@ -188,8 +158,6 @@ public sealed class Settings
 
     }
 
-
-
     private static readonly JsonSerializerOptions JsonOptions = new()
 
     {
@@ -208,8 +176,6 @@ public sealed class Settings
 
 }
 
-
-
 /// <summary>Words the user has told us to leave alone (one per line, lowercase).</summary>
 
 public sealed class Exceptions
@@ -219,8 +185,6 @@ public sealed class Exceptions
     private readonly HashSet<string> _words = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly object _lock = new();
-
-
 
     public Exceptions()
 
@@ -233,8 +197,6 @@ public sealed class Exceptions
         LoadFile(Settings.ExceptionsPath);
 
     }
-
-
 
     private void LoadFile(string path)
 
@@ -262,11 +224,7 @@ public sealed class Exceptions
 
     }
 
-
-
     public bool Contains(string word) { lock (_lock) return _words.Contains(word); }
-
-
 
     public void Add(string word)
 
@@ -300,8 +258,6 @@ public sealed class Exceptions
 
 }
 
-
-
 public static class Log
 
 {
@@ -309,8 +265,6 @@ public static class Log
     private static readonly object _lock = new();
 
     public static bool Enabled = true;
-
-
 
     public static void Write(string message)
 

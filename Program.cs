@@ -2,11 +2,7 @@ using System.Runtime.InteropServices;
 
 using System.Windows.Forms;
 
-
-
 namespace Switcher;
-
-
 
 internal static class Program
 
@@ -22,14 +18,10 @@ internal static class Program
 
             return SelfTest.Run(args.Skip(1).ToArray());
 
-
-
         using var mutex = new Mutex(true, @"Local\Switcher_SingleInstance", out bool created);
 
         if (!created) return 0; // already running
         Settings.MigrateFromLayoutFix();
-
-
 
         Application.EnableVisualStyles();
 
@@ -37,13 +29,9 @@ internal static class Program
 
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
 
-
-
         Application.ThreadException += (_, e) => Log.Write("UI exception: " + e.Exception);
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Log.Write("Unhandled: " + e.ExceptionObject);
-
-
 
         Application.Run(new TrayApp());
 
@@ -52,8 +40,6 @@ internal static class Program
     }
 
 }
-
-
 
 /// <summary>
 
@@ -69,8 +55,6 @@ internal static class SelfTest
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern short VkKeyScanExW(char ch, IntPtr dwhkl);
 
-
-
     public static int Run(string[] words)
 
     {
@@ -80,8 +64,6 @@ internal static class SelfTest
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
         Console.WriteLine();
-
-
 
         var settings = Settings.Load();
 
@@ -101,8 +83,6 @@ internal static class SelfTest
 
         var speller = new SpellFixer(dicts, freq, new Autocorrect());
 
-
-
         var layouts = Layouts.Installed();
 
         Console.WriteLine("layouts: " + string.Join(", ", layouts.Select(h => $"{Layouts.Name(h)} ({(long)h:X8})")));
@@ -113,8 +93,6 @@ internal static class SelfTest
 
         if (ru == IntPtr.Zero || en == IntPtr.Zero) { Console.WriteLine("need both RU and EN layouts installed"); return 1; }
 
-
-
         if (words.Length == 1 && words[0].StartsWith('@'))
 
             words = File.ReadAllLines(words[0][1..]).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith('#')).ToArray();
@@ -124,8 +102,6 @@ internal static class SelfTest
             words = new[] { "ghbdtn", "ghbdtn/", "Ghbdtn", "hello", "руддщ", "привет", "ntrcn", "ыефке", "world", "vbh", "мир",
 
                             "првиет", "hlelo", "tset", "проект", "лол", "хз", "in", "шт", "ok", "да", "lf", "ща", "elif", "foreach", "ghbdtn,", "vjcrdf" };
-
-
 
         foreach (var raw in words)
 
@@ -146,8 +122,6 @@ internal static class SelfTest
             var typedHkl = cyr ? ru : en;
 
             var otherHkl = cyr ? en : ru;
-
-
 
             var keys = new List<TypedKey>();
 
@@ -173,15 +147,11 @@ internal static class SelfTest
 
             if (!ok) { Console.WriteLine($"{w,-14} ?  (cannot type this in {Layouts.Name(typedHkl)})"); continue; }
 
-
-
             string typed = WordTracker.Render(keys, typedHkl);
 
             string alt = WordTracker.Render(keys, otherHkl);
 
             bool hasDigits = keys.Any(k => WordTracker.IsDigitKey(k.Vk));
-
-
 
             sw.Restart();
 
@@ -190,8 +160,6 @@ internal static class SelfTest
             if (d.Kind == ActionKind.FixSpelling) d = speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout, ctx);
 
             long ms = sw.ElapsedMilliseconds;
-
-
 
             string verdict = d.Kind switch
 

@@ -1,33 +1,56 @@
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <Nullable>enable</Nullable>
-    <UseWindowsForms>true</UseWindowsForms>
-    <UseWPF>true</UseWPF> <!-- only for System.Windows.Automation (password fields) -->
-    <ImplicitUsings>enable</ImplicitUsings>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
-    <AssemblyName>Switcher</AssemblyName>
-    <RootNamespace>Switcher</RootNamespace>
-    <Version>0.1.1</Version>
-    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <InvariantGlobalization>false</InvariantGlobalization>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <Using Include="System.IO" /> <!-- UseWPF drops it from the implicit usings -->
-  </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="WeCantSpell.Hunspell" Version="5.2.1" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Include="dict\*.aff;dict\*.dic;dict\*.txt">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
-
-</Project>
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+
+    <OutputType>WinExe</OutputType>
+
+    <TargetFramework>net8.0-windows</TargetFramework>
+
+    <Nullable>enable</Nullable>
+
+    <UseWindowsForms>true</UseWindowsForms>
+
+    <UseWPF>true</UseWPF> <!-- only for System.Windows.Automation (password fields) -->
+
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <AssemblyName>Switcher</AssemblyName>
+
+    <RootNamespace>Switcher</RootNamespace>
+
+    <Version>0.1.1</Version>
+
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <InvariantGlobalization>false</InvariantGlobalization>
+
+  </PropertyGroup>
+
+  <ItemGroup>
+
+    <Using Include="System.IO" /> <!-- UseWPF drops it from the implicit usings -->
+
+  </ItemGroup>
+
+  <ItemGroup>
+
+    <PackageReference Include="WeCantSpell.Hunspell" Version="5.2.1" />
+
+  </ItemGroup>
+
+  <ItemGroup>
+
+    <None Include="dict\*.aff;dict\*.dic;dict\*.txt">
+
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+
+    </None>
+
+  </ItemGroup>
+
+</Project>
+

@@ -18,18 +18,14 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 KEYEVENTF_EXTENDEDKEY = 0x0001
 
-
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", w.WORD), ("wScan", w.WORD), ("dwFlags", w.DWORD), ("time", w.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
 
 class _U(ctypes.Union):
     _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
 
-
 class INPUT(ctypes.Structure):
     _fields_ = [("type", w.DWORD), ("u", _U)]
-
 
 def send(scan, up=False, extended=False):
     inp = INPUT()
@@ -41,19 +37,15 @@ def send(scan, up=False, extended=False):
         log(f"SendInput failed scan={scan:X} err={ctypes.windll.kernel32.GetLastError()}")
         raise SystemExit("SendInput failed")
 
-
 def tap(scan, extended=False):
     send(scan, False, extended)
     send(scan, True, extended)
 
-
 LOG = __import__("os").path.join(__import__("os").path.dirname(__file__), "typer.log")
-
 
 def log(msg):
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(msg + chr(10))
-
 
 def main():
     text = sys.argv[1]
@@ -108,7 +100,6 @@ def main():
         sent += 2
         time.sleep(delay)
     log(f"done: {sent} events in {(time.perf_counter() - t0) * 1000:.1f} ms (delay {delay * 1000:.0f} ms)")
-
 
 if __name__ == "__main__":
     try:

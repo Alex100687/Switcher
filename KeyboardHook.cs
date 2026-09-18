@@ -1,14 +1,8 @@
 using System.Runtime.InteropServices;
 
-
-
 namespace Switcher;
 
-
-
 public readonly record struct KeyEventArgs(uint Vk, uint Scan, bool Injected, bool Extended);
-
-
 
 /// <summary>
 
@@ -30,8 +24,6 @@ public sealed class KeyboardHook : IDisposable
 
     private readonly Native.HookProc _mouseProc;
 
-
-
     /// <summary>Return true to swallow the key-down event.</summary>
 
     public Func<KeyEventArgs, bool>? KeyDown;
@@ -42,13 +34,9 @@ public sealed class KeyboardHook : IDisposable
 
     public Action? Trigger;
 
-
-
     /// <summary>Debug aid: with SWITCHER_ACCEPT_INJECTED=1 only our own output is ignored, other synthetic input is processed.</summary>
 
     private static readonly bool AcceptInjected = Environment.GetEnvironmentVariable("SWITCHER_ACCEPT_INJECTED") == "1";
-
-
 
     /// <summary>True while this thread is executing a low-level keyboard hook callback.</summary>
 
@@ -64,8 +52,6 @@ public sealed class KeyboardHook : IDisposable
 
     [ThreadStatic] public static bool InHardwareCallback;
 
-
-
     public KeyboardHook()
 
     {
@@ -75,8 +61,6 @@ public sealed class KeyboardHook : IDisposable
         _mouseProc = MouseProc;
 
     }
-
-
 
     public void Install()
 
@@ -97,8 +81,6 @@ public sealed class KeyboardHook : IDisposable
             Log.Write("Mouse hook failed: " + Marshal.GetLastWin32Error());
 
     }
-
-
 
     private IntPtr KeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
 
@@ -125,8 +107,6 @@ public sealed class KeyboardHook : IDisposable
         }
 
     }
-
-
 
     private IntPtr KeyboardProcCore(int nCode, IntPtr wParam, IntPtr lParam)
 
@@ -200,8 +180,6 @@ public sealed class KeyboardHook : IDisposable
 
     }
 
-
-
     private IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
 
     {
@@ -235,8 +213,6 @@ public sealed class KeyboardHook : IDisposable
         return Native.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
     }
-
-
 
     public void Dispose()
 

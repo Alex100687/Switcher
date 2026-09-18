@@ -330,7 +330,7 @@ public sealed class Engine : IDisposable
             if (r == null) continue;
             SafeRun(() =>
             {
-                if (Volatile.Read(ref _epoch) != r.Epoch) { if (r.Hold) Injector.PressKey(r.BoundaryVk); return; } // stale before we even started
+                if (Volatile.Read(ref _epoch) != r.Epoch) { if (Debug) Log.Write($"fix '{r.Typed}' stale before start"); if (r.Hold) Injector.PressKey(r.BoundaryVk); return; }
                 var fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
                 RunInHook(() => ApplyFix(fix, r.Typed, r.Layout, r.Alt, r.Other, r.Hwnd, r.Focus, r.BoundaryVk, r.Hold, r.Boundary, r.Epoch));
             });
@@ -344,9 +344,10 @@ public sealed class Engine : IDisposable
                 // The world may have changed while we were thinking: the user switched windows or fields, turned the
                 // feature off, or the app is now excluded. Then nothing is typed anywhere — a held Enter/Tab is dropped
                 // rather than delivered to whatever has focus now.
-                if (_disposed || !_settings.Enabled || !_settings.AutoFixSpelling) return;
+                if (_disposed || !_settings.Enabled || !_settings.AutoFixSpelling) { if (Debug) Log.Write("fix dropped: disabled"); return; }
                 if (Native.GetForegroundWindow() != hwnd || Injector.FocusWindow(hwnd) != focus) { Log.Write("fix dropped: focus moved"); return; }
-                if (IsExcluded(hwnd) || _passwords.IsPasswordField(hwnd)) return;
+                if (IsExcluded(hwnd)) { if (Debug) Log.Write("fix dropped: excluded"); return; }
+                if (_passwords.IsPasswordField(hwnd)) { if (Debug) Log.Write("fix dropped: password/unknown field"); return; }
                 {
                     bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != typed;
 

@@ -60,6 +60,7 @@ public sealed class PasswordDetector
             _busy = true;
             _pending = focus;
             _pendingSince = DateTime.UtcNow;
+            _answered.Reset();
             _pendingCaret = caret;
             _pendingHasCaret = hasCaret;
         }
@@ -75,14 +76,23 @@ public sealed class PasswordDetector
     {
         var focus = Injector.FocusWindow(foreground);
         if (HasPasswordStyle(focus)) return true;
+        bool pending;
         lock (_lock)
         {
             if (focus == _cachedFocus) return _cachedValue;
-            // no answer for this control yet: treat as unsafe only while a fresh query can still be expected
-            return !Disabled && _busy && _pending == focus && DateTime.UtcNow - _pendingSince < PendingGrace;
+            pending = !Disabled && _busy && _pending == focus && DateTime.UtcNow - _pendingSince < PendingGrace;
         }
+        if (!pending) return false;
+        // the first answer for this control is on its way: give it a moment (usually < 10 ms) before deciding.
+        // Still unknown after that → treat as a normal field: UIA can take 100+ ms in browsers, and skipping the
+        // first word after every click is a worse everyday experience than the residual risk (ES_PASSWORD above
+        // still catches classic password boxes instantly).
+        _answered.Wait(AnswerWait);
+        lock (_lock) return focus == _cachedFocus && _cachedValue;
     }
     private static readonly TimeSpan PendingGrace = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan AnswerWait = TimeSpan.FromMilliseconds(30);
+    private readonly ManualResetEventSlim _answered = new(false);
     private DateTime _pendingSince;
 
     private static bool HasPasswordStyle(IntPtr focus)
@@ -123,12 +133,14 @@ public sealed class PasswordDetector
                 }
             }
             catch (Exception ex) { Log.Write("UIA: " + ex.Message); }
+            if (Environment.GetEnvironmentVariable("SWITCHER_DEBUG") == "1") Log.Write($"UIA answer for {focus:X}: password={result}");
             lock (_lock)
             {
                 _cachedFocus = focus;
                 _cachedValue = result;
                 _cachedAt = DateTime.UtcNow;
                 _busy = false;
+                _answered.Set();
             }
         }
     }

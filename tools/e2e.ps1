@@ -17,7 +17,7 @@ $script:failures = 0
 $env:SWITCHER_ACCEPT_INJECTED = "1"; $env:SWITCHER_NO_EXCLUDE = "1"; if ($Debug) { $env:SWITCHER_DEBUG = "1" }; if ($NoUia) { $env:SWITCHER_NO_UIA = "1" }
 $data = Join-Path $env:TEMP "Switcher_e2e"; Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $data | Out-Null
 $env:SWITCHER_DATA_DIR = $data
-'{ "Hotkey": "F9" }' | Set-Content -Path (Join-Path $data "settings.json") -Encoding UTF8
+'{ "Hotkey": "F9", "LogActions": true }' | Set-Content -Path (Join-Path $data "settings.json") -Encoding UTF8
 $proc = Start-Process -FilePath (Resolve-Path $Exe) -PassThru
 # wait until dictionaries and frequency lists are loaded (the log says so)
 $logPath = Join-Path $data "log.txt"

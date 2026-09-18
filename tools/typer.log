@@ -1,0 +1,24 @@
+start text='cltkfnm rfr ltkf ' fg=3013D4 expect=0
+done: 34 events in 746.6 ms (delay 40 ms)
+start text='cltfknm rfr ltkf ' fg=3013D4 expect=0
+done: 34 events in 740.6 ms (delay 40 ms)
+start text='ghdbtn rfr ltkf ghdbtn ' fg=3013D4 expect=0
+done: 46 events in 985.8 ms (delay 40 ms)
+start text='ghbdtn {SLEEP:300}hello wjrld ' fg=3013D4 expect=0
+done: 38 events in 1135.3 ms (delay 40 ms)
+start text='{ALTSHIFT}ghbdtn {ALTSHIFT}ult{ALTSHIFT} kt;fn ' fg=3013D4 expect=0
+done: 34 events in 857.2 ms (delay 40 ms)
+start text='cltkfnm rfr ' fg=3013D4 expect=0
+done: 24 events in 61.2 ms (delay 0 ms)
+start text='cltkfnm rfr ltkf ' fg=150C1C expect=0
+done: 34 events in 738.1 ms (delay 40 ms)
+start text='cltfknm rfr ltkf ' fg=150C1C expect=0
+done: 34 events in 739.2 ms (delay 40 ms)
+start text='ghdbtn rfr ltkf ghdbtn ' fg=150C1C expect=0
+done: 46 events in 988.3 ms (delay 40 ms)
+start text='ghbdtn {SLEEP:300}hello wjrld ' fg=150C1C expect=0
+done: 38 events in 1146.5 ms (delay 40 ms)
+start text='{ALTSHIFT}ghbdtn {ALTSHIFT}ult{ALTSHIFT} kt;fn ' fg=150C1C expect=0
+done: 34 events in 857.7 ms (delay 40 ms)
+start text='cltkfnm rfr ' fg=150C1C expect=0
+done: 24 events in 57.9 ms (delay 0 ms)

@@ -18,9 +18,19 @@ public sealed class KeyboardHook : IDisposable
     /// <summary>Return true to swallow the key-down event.</summary>
     public Func<KeyEventArgs, bool>? KeyDown;
     public Action? MouseDown;
+    /// <summary>Raised inside the hook callback of a trigger event (see <see cref="Injector.SendTrigger"/>).</summary>
+    public Action? Trigger;
 
     /// <summary>Debug aid: with LAYOUTFIX_ACCEPT_INJECTED=1 only our own output is ignored, other synthetic input is processed.</summary>
     private static readonly bool AcceptInjected = Environment.GetEnvironmentVariable("LAYOUTFIX_ACCEPT_INJECTED") == "1";
+
+    /// <summary>True while this thread is executing a low-level keyboard hook callback.</summary>
+    [ThreadStatic] public static bool InCallback;
+    /// <summary>
+    /// True while executing the callback of a *hardware* key: the input thread is blocked on us, so anything we
+    /// SendInput now reaches the app before that key and before any key pressed later — the only atomic moment.
+    /// </summary>
+    [ThreadStatic] public static bool InHardwareCallback;
 
     public KeyboardHook()
     {
@@ -41,16 +51,42 @@ public sealed class KeyboardHook : IDisposable
 
     private IntPtr KeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
+        bool outer = !InCallback;
+        InCallback = true;
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        try { return KeyboardProcCore(nCode, wParam, lParam); }
+        finally
+        {
+            if (outer) InCallback = false;
+            double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (ms > 2) Log.Write($"slow hook callback: {ms:0.0} ms (msg {(int)wParam:X})");
+        }
+    }
+
+    private IntPtr KeyboardProcCore(int nCode, IntPtr wParam, IntPtr lParam)
+    {
         if (nCode >= 0)
         {
             int msg = (int)wParam;
-            if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
+            if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN || msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
             {
                 var k = Marshal.PtrToStructure<Native.KBDLLHOOKSTRUCT>(lParam);
+                if (k.dwExtraInfo == Injector.TriggerSignature)
+                {
+                    if (msg == Native.WM_KEYDOWN)
+                    {
+                        try { Trigger?.Invoke(); }
+                        catch (Exception ex) { Log.Write("Trigger handler error: " + ex); }
+                    }
+                    return (IntPtr)1; // never reaches any app
+                }
+                if (msg != Native.WM_KEYDOWN && msg != Native.WM_SYSKEYDOWN) return Native.CallNextHookEx(_kbHook, nCode, wParam, lParam);
                 bool injected = k.dwExtraInfo == Injector.Signature || (!AcceptInjected && (k.flags & Native.LLKHF_INJECTED) != 0);
                 bool extended = (k.flags & 0x01) != 0;
+                bool hardware = (k.flags & Native.LLKHF_INJECTED) == 0 || (AcceptInjected && k.dwExtraInfo != Injector.Signature);
                 try
                 {
+                    InHardwareCallback = hardware;
                     if (KeyDown?.Invoke(new KeyEventArgs(k.vkCode, k.scanCode, injected, extended)) == true)
                         return (IntPtr)1;
                 }
@@ -58,6 +94,7 @@ public sealed class KeyboardHook : IDisposable
                 {
                     Log.Write("Hook handler error: " + ex);
                 }
+                finally { InHardwareCallback = false; }
             }
         }
         return Native.CallNextHookEx(_kbHook, nCode, wParam, lParam);

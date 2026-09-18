@@ -11,11 +11,31 @@ public sealed class Engine : IDisposable
     private readonly Dictionaries _dicts;
     private readonly Corrector _corrector;
     private readonly SpellFixer _speller;
-    /// <summary>Runs an action on the hook (UI) thread: every SendInput goes through it so injections never interleave.</summary>
-    private readonly Action<Action> _onUi;
+    /// <summary>
+    /// Deferred injections. Injected input is processed in the injecting thread's context while the real input
+    /// thread keeps delivering the user's keys, so the only moment a SendInput is atomic against typing is inside
+    /// the hook callback of a hardware key. Hence: a ready fix waits for the next key the user presses and is
+    /// applied right before it; if the user has paused, it is applied via a trigger event instead (nothing to
+    /// interleave with). Either way the work runs on the hook thread.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentQueue<Action> _deferred = new();
+    private long _lastHardwareKeyTicks;
+    private static readonly TimeSpan IdleGap = TimeSpan.FromMilliseconds(150);
+
+    private void RunInHook(Action a)
+    {
+        _deferred.Enqueue(a);
+        var sinceKey = TimeSpan.FromTicks(DateTime.UtcNow.Ticks - Volatile.Read(ref _lastHardwareKeyTicks));
+        if (sinceKey > IdleGap) { Injector.SendTrigger(); return; }
+        // the user is typing: the next key's callback will drain the queue; if no key comes, fall back to a trigger
+        Task.Delay(IdleGap).ContinueWith(_ => { if (!_deferred.IsEmpty) Injector.SendTrigger(); });
+    }
+    private void DrainDeferred() { while (_deferred.TryDequeue(out var a)) SafeRun(a); }
+    private void OnTrigger() => DrainDeferred();
     private readonly KeyboardHook _hook;
     private readonly WordTracker _word = new();
     private readonly Hotkey _hotkey;
+    private readonly PasswordDetector _passwords = new();
     private readonly Dictionary<uint, string> _processNames = new();
     private readonly object _lock = new();
 
@@ -46,16 +66,15 @@ public sealed class Engine : IDisposable
 
     public event Action<string>? Notify;
 
-    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller, Action<Action> onUi)
+    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller)
     {
         _speller = speller;
-        _onUi = onUi;
         _settings = settings;
         _exceptions = exceptions;
         _dicts = dicts;
         _corrector = new Corrector(dicts, exceptions, settings, freq);
         _hotkey = Hotkey.Parse(settings.Hotkey);
-        _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = Invalidate };
+        _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = () => { Invalidate(); _passwords.Touch(Native.GetForegroundWindow()); }, Trigger = OnTrigger };
     }
 
     public void Start() => _hook.Install();
@@ -68,6 +87,9 @@ public sealed class Engine : IDisposable
     {
         if (Debug) Log.Write($"key vk={e.Vk:X2} scan={e.Scan:X2} injected={e.Injected} fg={Native.GetForegroundWindow():X} layout={(long)Layouts.Current(Native.GetForegroundWindow()):X8} buf={_word.Count}");
         if (e.Injected) return false; // our own output (or another tool's) — never react to it
+
+        Volatile.Write(ref _lastHardwareKeyTicks, DateTime.UtcNow.Ticks);
+        if (KeyboardHook.InHardwareCallback && !_deferred.IsEmpty) DrainDeferred(); // a ready fix goes in ahead of this key
 
         uint vk = e.Vk;
 
@@ -83,7 +105,7 @@ public sealed class Engine : IDisposable
                 wordLayout = _word.Layout;
             }
             _word.Reset();
-            _onUi(() => SafeRun(() => HandleHotkey(hk, keys, wordLayout)));
+            SafeRun(() => HandleHotkey(hk, keys, wordLayout)); // inside the callback: injection is atomic here
             return true;
         }
 
@@ -102,6 +124,7 @@ public sealed class Engine : IDisposable
 
         var hwnd = Native.GetForegroundWindow();
         var layout = Layouts.Current(hwnd);
+        _passwords.Touch(hwnd); // background refresh; never blocks
 
         if (!_word.IsEmpty && hwnd != _word.Hwnd) Invalidate();
         else if (!_word.IsEmpty && layout != IntPtr.Zero && layout != _word.Layout)
@@ -138,6 +161,28 @@ public sealed class Engine : IDisposable
         return false;
     }
 
+    /// <summary>Ask the window to switch, then make sure it did; some apps ignore the request — press the system hotkey.</summary>
+    private DateTime _lastToggle = DateTime.MinValue;
+    private void SwitchLayoutVerified(IntPtr hwnd, IntPtr target)
+    {
+        int before = Native.LangId(Layouts.Current(hwnd));
+        Injector.SwitchLayout(hwnd, target);
+        if (!_settings.ToggleHotkeyIfIgnored || before == 0 || before == Native.LangId(target)) return;
+        Task.Delay(400).ContinueWith(_ => RunInHook(() => SafeRun(() =>
+        {
+            if (Native.GetForegroundWindow() != hwnd) return;
+            // compare languages, not HKL handles (the same layout can come back as a different handle);
+            // act only if the app still sits in the *old* language, and not more than once in a while
+            int now = Native.LangId(Layouts.Current(hwnd));
+            if (Debug) Log.Write($"verify layout: before={before:X4} target={Native.LangId(target):X4} now={now:X4} hkl={(long)Layouts.Current(hwnd):X8}");
+            if (now != before || Layouts.Installed().Length != 2) return;
+            if (DateTime.UtcNow - _lastToggle < TimeSpan.FromSeconds(2)) return;
+            _lastToggle = DateTime.UtcNow;
+            Log.Write("layout request ignored by the app — sending the toggle hotkey");
+            Injector.SendToggleHotkey();
+        })));
+    }
+
     private static bool IsModifierKey(uint vk) => vk is Native.VK_SHIFT or Native.VK_LSHIFT or Native.VK_RSHIFT
         or Native.VK_CONTROL or Native.VK_LCONTROL or Native.VK_RCONTROL or Native.VK_MENU or Native.VK_LMENU or Native.VK_RMENU
         or Native.VK_LWIN or Native.VK_RWIN or Native.VK_CAPITAL;
@@ -165,6 +210,7 @@ public sealed class Engine : IDisposable
         if (flip && Corrector.IsWordShaped(core) && _corrector.IsKnown(oldLang, core))
             flip = _corrector.PreferOther(core, oldLang, flippedCore, newLang, ContextFor(hwnd), out _);
         if (Debug) Log.Write($"manual switch '{typed}' → '{flipped}' flip={flip}");
+        if (flip && _passwords.IsPasswordField(hwnd)) flip = false;
         if (!flip) { Invalidate(); return false; }
 
         Injector.Replace(typed.Length, flipped);
@@ -222,16 +268,20 @@ public sealed class Engine : IDisposable
                 return false;
 
             case ActionKind.SwitchLayout:
+                if (_passwords.IsPasswordField(hwnd)) return false; // never rewrite a password
                 // Synchronously, right here in the hook: our replacement keystrokes must be queued before
                 // whatever the user types next, otherwise a fast typist gets the two words interleaved.
-                Injector.SwitchLayout(hwnd, other);
+                SwitchLayoutVerified(hwnd, other);
+                var sws = System.Diagnostics.Stopwatch.StartNew();
                 Injector.Replace(typed.Length, alt, boundaryVk);
+                Log.Write($"  sync Replace took {sws.ElapsedMilliseconds} ms inCallback={KeyboardHook.InCallback}");
                 SetContext(hwnd, altLang);
                 Remember(alt, other, typed, layout, boundaryVk, hwnd, wasAuto: true);
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {alt}  [{decision.Reason}]")));
                 return true;
 
             case ActionKind.FixSpelling:
+                if (_passwords.IsPasswordField(hwnd)) return false;
                 // Suggest takes ~100 ms, so this runs on a worker. A space goes through to the app right away
                 // (no typing lag); Enter/Tab are held back, because in a chat Enter would send the unfixed word.
                 bool hold = boundaryVk != Native.VK_SPACE;
@@ -239,14 +289,14 @@ public sealed class Engine : IDisposable
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
                 {
                     var fix = _speller.FixEither(typed, layout, alt, other, _settings.AutoSwitchLayout, ctx);
-                    _onUi(() => SafeRun(() => ApplyFix(fix, typed, layout, alt, other, hwnd, boundaryVk, hold, boundary, epoch)));
+                    RunInHook(() => ApplyFix(fix, typed, layout, alt, other, hwnd, boundaryVk, hold, boundary, epoch));
                 }));
                 return hold;
         }
         return false;
     }
 
-    /// <summary>On the hook thread, so it cannot interleave with a synchronous switch of the next word.</summary>
+    /// <summary>Runs inside a hook callback: every earlier key has been seen, and our SendInput is queued atomically.</summary>
     private void ApplyFix(Decision fix, string typed, IntPtr layout, string alt, IntPtr other, IntPtr hwnd,
         int boundaryVk, bool hold, string boundary, int epoch)
     {
@@ -281,8 +331,13 @@ public sealed class Engine : IDisposable
                         else if (hold) { backspaces = pendingOld.Length; text = boundary + pendingOld; } // held Enter/Tab goes before the new letters
                         else { backspaces = 0; text = ""; }
 
-                        if (fixing && fix.SwitchLayout) { Injector.SwitchLayout(hwnd, other); _word.SetLayout(other); }
-                        if (backspaces > 0 || text.Length > 0) Injector.Replace(backspaces, text);
+                        if (fixing && fix.SwitchLayout) { SwitchLayoutVerified(hwnd, other); _word.SetLayout(other); }
+                        if (backspaces > 0 || text.Length > 0)
+                        {
+                            var swi = System.Diagnostics.Stopwatch.StartNew();
+                            Injector.Replace(backspaces, text);
+                            if (Debug) Log.Write($"  Replace({backspaces}, '{text}') took {swi.ElapsedMilliseconds} ms on thread {Environment.CurrentManagedThreadId}");
+                        }
                     }
 
                     if (!fixing)
@@ -318,7 +373,7 @@ public sealed class Engine : IDisposable
             string typed = WordTracker.Render(keys, layout);
             string alt = WordTracker.Render(keys, other);
             if (typed.Length == 0 || alt.Length == 0) return;
-            Injector.SwitchLayout(hwnd, other);
+            SwitchLayoutVerified(hwnd, other);
             Injector.Replace(typed.Length, alt);
             SetContext(hwnd, Native.LangId(other));
             Remember(alt, other, typed, layout, 0, hwnd, wasAuto: false);
@@ -338,14 +393,15 @@ public sealed class Engine : IDisposable
             Native.VK_TAB => "\t",
             _ => "",
         };
-        Injector.SwitchLayout(hwnd, last.AltLayout);
+        SwitchLayoutVerified(hwnd, last.AltLayout);
         Injector.Replace(last.Text.Length + trailing.Length, last.AltText + trailing);
         SetContext(hwnd, Native.LangId(last.AltLayout));
 
         if (last.WasAuto)
         {
             // the user disagreed with us — never touch this word again
-            _exceptions.Add(last.OriginalCore);
+            var learned = last.OriginalCore;
+            ThreadPool.QueueUserWorkItem(_ => SafeRun(() => _exceptions.Add(learned)));
             Report($"[undo] {last.Text} → {last.AltText}, '{last.OriginalCore}' добавлено в исключения");
         }
         else

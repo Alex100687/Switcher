@@ -20,7 +20,6 @@ public sealed class TrayApp : ApplicationContext
     private readonly Icon _iconOn;
     private readonly Icon _iconOff;
     private Engine? _engine;
-    private Control _dispatcher = null!;
 
     private ToolStripMenuItem _miEnabled = null!, _miSwitch = null!, _miSpell = null!, _miBeep = null!, _miAutostart = null!, _miStatus = null!;
 
@@ -42,11 +41,8 @@ public sealed class TrayApp : ApplicationContext
         };
         _icon.DoubleClick += (_, _) => ToggleEnabled();
 
-        // hidden control = a marshaller onto the UI thread, where the keyboard hook also runs
-        _dispatcher = new Control();
-        _ = _dispatcher.Handle; // force handle creation so BeginInvoke works
-        _engine = new Engine(_settings, _exceptions, _dicts, _freq, new SpellFixer(_dicts, _freq, new Autocorrect()),
-            a => { if (_dispatcher.IsHandleCreated) _dispatcher.BeginInvoke(a); });
+        var speller = new SpellFixer(_dicts, _freq, new Autocorrect());
+        _engine = new Engine(_settings, _exceptions, _dicts, _freq, speller);
         _engine.Notify += _ => { };
         try
         {
@@ -61,7 +57,7 @@ public sealed class TrayApp : ApplicationContext
 
         Task.Run(() =>
         {
-            try { _dicts.Load(); _freq.Load(); Log.Write("Frequencies loaded"); }
+            try { _dicts.Load(); _freq.Load(); Log.Write("Frequencies loaded"); speller.WarmUp(); }
             catch (Exception ex)
             {
                 Log.Write("Dictionary load failed: " + ex);

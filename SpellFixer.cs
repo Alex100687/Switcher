@@ -30,10 +30,13 @@ public sealed class Frequencies
     }
 
     /// <summary>Rank of the word (case-insensitive, ё=е) or int.MaxValue if unknown.</summary>
-    public int Rank(int lang, string word)
+    public int Rank(int lang, string word) => RankNormalized(lang, word.ToLowerInvariant().Replace('ё', 'е'));
+
+    /// <summary>Same, for a word that is already lowercase with ё→е (hot path of candidate generation).</summary>
+    public int RankNormalized(int lang, string word)
     {
         if (!_ranks.TryGetValue(lang, out var d)) return int.MaxValue;
-        return d.TryGetValue(word.ToLowerInvariant().Replace('ё', 'е'), out var r) ? r : int.MaxValue;
+        return d.TryGetValue(word, out var r) ? r : int.MaxValue;
     }
 }
 
@@ -90,6 +93,8 @@ public sealed class SpellFixer
         _auto = auto;
     }
 
+    private static readonly bool FixDebug = Environment.GetEnvironmentVariable("LAYOUTFIX_FIXDEBUG") == "1";
+
     /// <summary>Typed words at least this frequent are treated as real (colloquial) words and left alone.</summary>
     public static int KnownRankLimit(int lang) => lang == Dictionaries.LangRu ? 10_000 : 5_000;
 
@@ -103,6 +108,10 @@ public sealed class SpellFixer
         var typedTask = Task.Run(() => Fix(typed, layout));
         var asAlt = Fix(alt, other);
         var asTyped = typedTask.GetAwaiter().GetResult();
+        // two guesses stacked (wrong layout AND a typo) must be convincing: a good score and a real-sized word
+        if (asAlt.Kind == ActionKind.FixSpelling
+            && (asAlt.Score > 1.3 || Corrector.StripPunctuation(asAlt.NewText, out _, out _).Length < 4))
+            asAlt = Decision.Keep;
         if (asAlt.Kind != ActionKind.FixSpelling) return asTyped;
         if (asTyped.Kind != ActionKind.FixSpelling) return asAlt with { SwitchLayout = true, Reason = asAlt.Reason + ", switch" };
         // two hypotheses at once (wrong layout AND a typo): the language of the surrounding text gets a head start,
@@ -110,6 +119,17 @@ public sealed class SpellFixer
         double bias = contextLang == Native.LangId(other) ? -0.3 : contextLang == Native.LangId(layout) ? 0.3 : 0.1;
         if (asTyped.Score <= asAlt.Score + bias) return asTyped;
         return asAlt with { SwitchLayout = true, Reason = asAlt.Reason + ", switch" };
+    }
+
+    /// <summary>JIT and caches: run once after loading so the first real correction is not the slow one.</summary>
+    public void WarmUp()
+    {
+        foreach (var h in Layouts.Installed())
+        {
+            int lang = Native.LangId(h);
+            if (lang == Dictionaries.LangRu) { Fix("првиет", h); Fix("здраствуйти", h); }
+            if (lang == Dictionaries.LangEn) { Fix("hlelo", h); Fix("definatley", h); }
+        }
     }
 
     public Decision Fix(string typed, IntPtr hkl)
@@ -149,20 +169,27 @@ public sealed class SpellFixer
     private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason, out double score)
     {
         reason = ""; score = 0;
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new Dictionary<string, int>(StringComparer.Ordinal); // normalized word → index in cands
         var cands = new List<Cand>();
 
+        // the same word can be reached by several paths — keep the cheapest
         void Add(string word, double? fixedCost = null)
         {
             var w = EditCost.Normalize(word.ToLowerInvariant());
-            if (w == norm || !seen.Add(w)) return;
+            if (w == norm) return;
             double cost = fixedCost ?? EditCost.Distance(norm, w, lang, hkl);
+            if (seen.TryGetValue(w, out var idx))
+            {
+                if (cost < cands[idx].Cost) cands[idx] = cands[idx] with { Cost = cost };
+                return;
+            }
+            seen[w] = cands.Count;
             cands.Add(new Cand(word, cost, _freq.Rank(lang, w)));
         }
 
-        // 1. Hunspell's own suggestions (single words; splits are generated below)
-        foreach (var s in _dicts.Suggest(lang, norm))
-            if (s.Length > 0 && !s.Contains('-') && !s.Contains(' ')) Add(s);
+        // generated variants are accepted only if they are in the frequency list anyway, and that lookup is ~1000×
+        // cheaper than Hunspell — so it goes first
+        bool IsWord(string v) => _freq.RankNormalized(lang, v) != int.MaxValue && _dicts.Check(lang, v);
 
         // 1b. A missed space: "инужно" → "и нужно", "вобщем" → "в общем". Russian only (English compounds are
         //     too often real words: raycast, webhook); both halves must be common, a tiny first word is typical.
@@ -175,20 +202,56 @@ public sealed class SpellFixer
                 if (!_dicts.Check(lang, a) || !_dicts.Check(lang, b)) continue;
                 double cost = ra <= 1_000 && rb <= 1_000 ? 0.9 : 1.25;
                 var split = a + " " + b;
-                if (seen.Add(split)) cands.Add(new Cand(split, cost, Math.Max(ra, rb)));
+                if (!seen.ContainsKey(split)) { seen[split] = cands.Count; cands.Add(new Cand(split, cost, Math.Max(ra, rb))); }
             }
 
         // 2. Our own: up to two cheap orthographic substitutions (Hunspell rarely finds "малако" → "молоко")
         foreach (var c in EditCost.CheapVariants(norm, lang, maxSubs: 2, limit: 400))
-            if (_dicts.Check(lang, c)) Add(c);
+            if (IsWord(c)) Add(c);
+
+        // 3. Every single edit (Hunspell caps its list at ~15 and misses some), then two edits where the first one
+        //    is a likely slip — transposition, cheap substitution, doubled letter, neighbouring key — and the second
+        //    anything. Overlapping transpositions ("првеит" → "привет") are cheaper as two steps than the DP thinks,
+        //    so a two-step candidate gets min(DP, step1 + step2).
+        var single = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var v in EditCost.SingleEdits(norm, lang))
+            if (single.Add(v) && IsWord(v)) Add(v);
+        if (norm.Length >= 5)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var tried = new HashSet<string>(StringComparer.Ordinal);
+            int mids = 0;
+            foreach (var (mid, stepCost) in EditCost.LikelySlips(norm, lang, hkl))
+            {
+                if (sw.ElapsedMilliseconds > 40) { if (FixDebug) Log.Write($"  two-step budget hit after {mids} intermediates"); break; }
+                if (!tried.Add(mid)) continue;
+                mids++;
+                foreach (var v in EditCost.SingleEdits(mid, lang))
+                {
+                    if (v == norm || !single.Add(v)) continue;
+                    if (!IsWord(v)) continue;
+                    double twoStep = stepCost + EditCost.Distance(mid, v, lang, hkl);
+                    Add(v, Math.Min(EditCost.Distance(norm, v, lang, hkl), twoStep));
+                }
+            }
+        }
+
+        if (FixDebug) Log.Write($"  fast stages: {cands.Count} cands, best {(cands.Count > 0 ? cands.Min(c => c.Score).ToString("0.00") : "-")}: " + string.Join(", ", cands.OrderBy(c => c.Score).Take(5).Select(c => $"{c.Word}({c.Cost:0.00}/{c.Rank})")));
+        // 4. Hunspell's own suggestions (REP table: phonetic spellings, n-gram guesses) — slow (30–100 ms),
+        //    so only when the fast generators have not already found a convincing candidate
+        if (cands.Count == 0 || cands.Min(c => c.Score) > 1.4)
+            foreach (var s in _dicts.Suggest(lang, norm))
+                if (s.Length > 0 && !s.Contains('-') && !s.Contains(' ')) Add(s);
 
         if (cands.Count == 0) return null;
         cands.Sort((a, b) => a.Score.CompareTo(b.Score));
         var best = cands[0];
 
         int len = norm.Length;
+        // longer words tolerate two edits; short ones collide with too much
+        double maxScore = len <= 5 ? 1.5 : len <= 7 ? 1.7 : 1.9;
         if (best.Rank == int.MaxValue) return null;                    // correcting towards a word nobody uses is a guess
-        if (best.Score > 1.5) return null;                             // too far and/or too rare
+        if (best.Score > maxScore) return null;                        // too far and/or too rare
         // short words collide with jargon and commands (sed, awk, sudo, хайр) — demand a cheap edit to a common word
         if (len == 3 && (best.Cost > 0.6 || best.Rank > (lang == Dictionaries.LangEn ? 300 : 5_000))) return null;
         if (len == 4 && (best.Cost > 1.0 || best.Rank > 10_000)) return null;
@@ -214,7 +277,7 @@ public static class EditCost
     private static readonly Dictionary<char, string> CheapRu = Build(
         "ао", "еи", "иы", "еэ", "ея", "ое", "ую", "ая", "зс", "дт", "бп", "вф", "гк", "жш", "чш", "щш", "хг", "цс", "ьъ", "йи");
     private static readonly Dictionary<char, string> CheapEn = Build(
-        "ae", "ei", "ou", "sz", "cs", "ck", "yi", "ao", "ui", "gj", "fv");
+        "ae", "ei", "ai", "ou", "sz", "cs", "ck", "yi", "ao", "ui", "gj", "fv");
 
     private const string ConsRu = "бвгджзйклмнпрстфхцчшщ";
     private const string ConsEn = "bcdfghjklmnpqrstvwxz";
@@ -283,6 +346,40 @@ public static class EditCost
                 d[i, j] = v;
             }
         return d[n, m];
+    }
+
+    private const string AlphaRu = "абвгдежзийклмнопрстуфхцчшщъыьэюя";
+    private const string AlphaEn = "abcdefghijklmnopqrstuvwxyz";
+
+    /// <summary>Every string one edit away: deletions, transpositions, substitutions, insertions.</summary>
+    public static IEnumerable<string> SingleEdits(string w, int lang)
+    {
+        string alpha = lang == Dictionaries.LangRu ? AlphaRu : AlphaEn;
+        int n = w.Length;
+        for (int i = 0; i < n; i++) yield return w.Remove(i, 1);
+        for (int i = 0; i + 1 < n; i++)
+            if (w[i] != w[i + 1]) yield return w[..i] + w[i + 1] + w[i] + w[(i + 2)..];
+        for (int i = 0; i < n; i++)
+            foreach (var c in alpha)
+                if (c != w[i]) yield return w[..i] + c + w[(i + 1)..];
+        for (int i = 0; i <= n; i++)
+            foreach (var c in alpha)
+                yield return w[..i] + c + w[i..];
+    }
+
+    /// <summary>The first of two edits: only the kinds of slip a fast typist actually makes, with their cost.</summary>
+    public static IEnumerable<(string word, double cost)> LikelySlips(string w, int lang, IntPtr hkl)
+    {
+        var table = lang == Dictionaries.LangRu ? CheapRu : CheapEn;
+        int n = w.Length;
+        for (int i = 0; i + 1 < n; i++)                                              // transposition
+            if (w[i] != w[i + 1]) yield return (w[..i] + w[i + 1] + w[i] + w[(i + 2)..], Transposition);
+        for (int i = 0; i < n; i++)                                                  // cheap substitution
+            if (table.TryGetValue(w[i], out var opts))
+                foreach (var c in opts) yield return (w[..i] + c + w[(i + 1)..], Cheap);
+        for (int i = 0; i + 1 < n; i++)                                              // doubled letter
+            if (w[i] == w[i + 1]) yield return (w.Remove(i, 1), Cheap);
+        // a missing letter is not a first step: "missing + X" is found as "X + missing" (order does not matter)
     }
 
     /// <summary>All words reachable from <paramref name="word"/> by 1..maxSubs cheap substitutions.</summary>

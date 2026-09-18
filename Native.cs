@@ -205,6 +205,25 @@ internal static class Native
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+
+    public const uint PM_NOREMOVE = 0x0000;
+    public const uint PM_QS_SENDMESSAGE = 0x0040 << 16;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+
+    public const uint QS_SENDMESSAGE = 0x0040;
+    public const uint MWMO_INPUTAVAILABLE = 0x0004;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint MsgWaitForMultipleObjectsEx(uint nCount, IntPtr[] pHandles, uint dwMilliseconds, uint dwWakeMask, uint dwFlags);
+
+    /// <summary>Dispatch pending inter-thread sent messages — including low-level hook callbacks waiting for this thread.</summary>
+    public static void PumpSentMessages() => PeekMessage(out _, IntPtr.Zero, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+
     public static bool IsDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
     public static bool IsToggled(int vk) => (GetKeyState(vk) & 0x0001) != 0;
 

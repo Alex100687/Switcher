@@ -1,12 +1,17 @@
 ﻿# End-to-end test: run LayoutFix with synthetic input accepted, type into a real TextBox, check the result.
-param([string]$Exe = "$PSScriptRoot\..\bin\Release\net8.0-windows\LayoutFix.exe", [string]$Only = "", [switch]$Debug)
+param([string]$Exe = "$PSScriptRoot\..\bin\Release\net8.0-windows\LayoutFix.exe", [string]$Only = "", [switch]$Debug, [switch]$NoUia)
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# SendKeys defaults to a journal playback hook, and while one is installed Windows attaches every thread's input
+# queue — keyboard layouts then leak between windows and the test becomes meaningless. Force SendInput instead.
+$f = [System.Windows.Forms.SendKeys].GetField("sendMethod", [Reflection.BindingFlags]"NonPublic,Static")
+$t = [System.Windows.Forms.SendKeys].GetNestedType("SendMethodTypes", [Reflection.BindingFlags]"NonPublic")
+if ($f -and $t) { $f.SetValue($null, [Enum]::ToObject($t, 3)) } else { "WARN: cannot switch SendKeys to SendInput" }
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 Get-Process LayoutFix -ErrorAction SilentlyContinue | Stop-Process -Force
-$env:LAYOUTFIX_ACCEPT_INJECTED = "1"; $env:LAYOUTFIX_NO_EXCLUDE = "1"; if ($Debug) { $env:LAYOUTFIX_DEBUG = "1" }
+$env:LAYOUTFIX_ACCEPT_INJECTED = "1"; $env:LAYOUTFIX_NO_EXCLUDE = "1"; if ($Debug) { $env:LAYOUTFIX_DEBUG = "1" }; if ($NoUia) { $env:LAYOUTFIX_NO_UIA = "1" }
 $data = Join-Path $env:TEMP "LayoutFix_e2e"; Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $data | Out-Null
 $env:LAYOUTFIX_DATA_DIR = $data
 '{ "Hotkey": "F9" }' | Set-Content -Path (Join-Path $data "settings.json") -Encoding UTF8
@@ -25,6 +30,9 @@ $form.StartPosition = 'CenterScreen'
 $tb = New-Object System.Windows.Forms.TextBox
 $tb.Multiline = $true; $tb.Dock = 'Fill'; $tb.Font = New-Object System.Drawing.Font("Consolas", 14)
 $form.Controls.Add($tb)
+$pw = New-Object System.Windows.Forms.TextBox
+$pw.UseSystemPasswordChar = $true; $pw.Dock = 'Bottom'
+$form.Controls.Add($pw)
 $form.Show(); $form.Activate(); $tb.Focus()
 [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 500
 
@@ -81,7 +89,27 @@ function Burst($name, $lang, $first, $rest, $accept) {
 # after our layout switch the same physical keys F,R,L,T,K,F now produce Cyrillic — SendKeys must be given the Cyrillic
 Burst "fix+switch, next word" $en "cltfknm r" "ак дела " @("сделать как дела ")
 Burst "fix, next word"        $ru "првиет к" "ак дела " @("привет как дела ")
-Burst "firehose no garbage"   $en "cltfknm rfr ltkf " "" @("сделать как дела ", "сдеалть как дела ")
+function Human($name, $lang, $keys, $expected, $delayMs = 40) {
+    # physical keys by scan code (tools	yper.py), <keys> in US-layout letters, a real pause between keys
+    if ($Only -and $name -notlike "*$Only*") { return }
+    if (-not (Ensure-Foreground $name)) { return }
+    $tb.Focus(); $tb.Clear(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    # pythonw: a console window would steal the foreground and swallow the keys
+    $pyw = Join-Path (Split-Path (Get-Command python).Source) "pythonw.exe"   # not the WindowsApps store stub
+    $p = Start-Process -FilePath $pyw -ArgumentList @("`"$PSScriptRoot\typer.py`"", "`"$keys`"", $delayMs) -PassThru
+    while (-not $p.HasExited) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 5 }
+    for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
+    $got = $tb.Text
+    if ($got -eq $expected) { "OK   {0,-22} got='{1}'" -f $name, $got } else { "FAIL {0,-22} got='{1}' expected='{2}'" -f $name, $got, $expected }
+}
+# a fast typist: 25 keys/s, no pauses between words (keys given as US-layout letters)
+Human "fast typist switch"    $en "cltkfnm rfr ltkf " "сделать как дела "
+Human "fast typist fix+sw"    $en "cltfknm rfr ltkf " "сделать как дела "
+Human "fast typist fix"       $ru "ghdbtn rfr ltkf ghdbtn " "привет как дела привет "
+Human "fast typist mixed"     $en "ghbdtn {SLEEP:300}hello wjrld " "привет hello world "
+# Russian context first (a real Russian word), then "ult" in EN, Alt+Shift by hand, and the sentence goes on
+Human "real Alt+Shift"        $en "{ALTSHIFT}ghbdtn {ALTSHIFT}ult{ALTSHIFT} kt;fn " "привет где лежат "
+Human "burst 0ms"             $en "cltkfnm rfr " "сделать как " 0
 Step "nofix fast"        $en "asdf qwer "      "asdf qwer "
 Step "collision ctx"     $en "ghbdtn tot "     "привет еще "
 Step "collision norm"    $en "tot "            "еще "
@@ -95,6 +123,14 @@ if ((-not $Only -or "manual switch" -like "*$Only*") -and (Ensure-Foreground "ma
     [System.Windows.Forms.SendKeys]::SendWait(" лежат ")
     for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     if ($tb.Text -eq "где лежат ") { "OK   manual switch         got='$($tb.Text)'" } else { "FAIL manual switch         got='$($tb.Text)' expected='где лежат '" }
+}
+# password box: never rewritten
+if ((-not $Only -or "password" -like "*$Only*") -and (Ensure-Foreground "password keep")) {
+    $pw.Clear(); $pw.Focus(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $en; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("ghbdtn ")
+    for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
+    if ($pw.Text -eq "ghbdtn ") { "OK   password keep         got='$($pw.Text)'" } else { "FAIL password keep         got='$($pw.Text)' expected='ghbdtn '" }
+    $tb.Focus(); [System.Windows.Forms.Application]::DoEvents()
 }
 Step "missed space"       $ru "инужно "        "и нужно "
 Step "vtoryi"             $ru "вторы "         "вторым "

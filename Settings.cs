@@ -32,6 +32,12 @@ public sealed class Settings
     /// <summary>Shortest word that may be spell-fixed.</summary>
     public int MinSpellFixLength { get; set; } = 3;
 
+    /// <summary>
+    /// If an app ignores our layout-change request, press the system toggle hotkey (Alt+Shift / Ctrl+Shift) instead.
+    /// Off by default: an app that merely processes the request late would end up flipped twice.
+    /// </summary>
+    public bool ToggleHotkeyIfIgnored { get; set; } = false;
+
     /// <summary>Play a short sound when a word is changed.</summary>
     public bool Beep { get; set; } = false;
 

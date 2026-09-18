@@ -13,18 +13,16 @@ public sealed record Decision(ActionKind Kind, string NewText, string Reason, do
 public sealed class Corrector
 {
     private readonly Dictionaries _dicts;
-    private readonly Exceptions _exceptions;
+    private readonly Rules _exceptions;
     private readonly Settings _settings;
     private readonly Frequencies _freq;
-    private readonly Autocorrect _auto;
 
-    public Corrector(Dictionaries dicts, Exceptions exceptions, Settings settings, Frequencies freq, Autocorrect auto)
+    public Corrector(Dictionaries dicts, Rules rules, Settings settings, Frequencies freq)
     {
         _dicts = dicts;
-        _exceptions = exceptions;
+        _exceptions = rules;
         _settings = settings;
         _freq = freq;
-        _auto = auto;
     }
 
     /// <summary>Word-shaped and known — used to update the language context.</summary>
@@ -61,7 +59,7 @@ public sealed class Corrector
 
         if (core.Length == 0) return Decision.Keep;
         // explicit autocorrect rules win over everything, including dictionary words ("ихний" → "их")
-        if (_settings.AutoFixSpelling && _auto.TryGet(core, out _))
+        if (_settings.AutoFixSpelling && _exceptions.TryAutocorrect(core, out _))
             return new Decision(ActionKind.FixSpelling, "", "autocorrect");
         if (_exceptions.Contains(core)) return Decision.Keep; // known word (whitelist / user's exceptions)
         if (IsCamelCase(core) || IsCamelCase(altCore)) return Decision.Keep; // myVar, GameObject — code, not prose

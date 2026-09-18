@@ -40,41 +40,6 @@ public sealed class Frequencies
     }
 }
 
-/// <summary>Explicit "wrong = right" replacements: built-in dict/autocorrect.txt + user's %AppData%\Switcher\autocorrect.txt.</summary>
-public sealed class Autocorrect
-{
-    private readonly Dictionary<string, string> _map = new(StringComparer.OrdinalIgnoreCase);
-
-    public static string UserPath => Path.Combine(Settings.Dir, "autocorrect.txt");
-
-    public Autocorrect()
-    {
-        LoadFile(Path.Combine(Dictionaries.DictDir, "autocorrect.txt"));
-        LoadFile(UserPath);
-    }
-
-    private void LoadFile(string path)
-    {
-        try
-        {
-            if (!File.Exists(path)) return;
-            foreach (var line in File.ReadAllLines(path))
-            {
-                var t = line.Trim();
-                if (t.Length == 0 || t.StartsWith('#')) continue;
-                int eq = t.IndexOf('=');
-                if (eq <= 0) continue;
-                var from = t[..eq].Trim();
-                var to = t[(eq + 1)..].Trim();
-                if (from.Length > 0 && to.Length > 0) _map[from] = to;
-            }
-        }
-        catch (Exception ex) { Log.Write($"Autocorrect load failed ({path}): {ex.Message}"); }
-    }
-
-    public bool TryGet(string word, out string replacement) => _map.TryGetValue(word, out replacement!);
-}
-
 /// <summary>
 /// Picks the best correction for a misspelled word. Candidates come from Hunspell and from combinations of
 /// "cheap" orthographic substitutions; they are scored by a weighted edit distance (typical spelling errors
@@ -84,15 +49,13 @@ public sealed class SpellFixer
 {
     private readonly Dictionaries _dicts;
     private readonly Frequencies _freq;
-    private readonly Autocorrect _auto;
-    private readonly Exceptions _exceptions;
+    private readonly Rules _rules;
 
-    public SpellFixer(Dictionaries dicts, Frequencies freq, Autocorrect auto, Exceptions exceptions)
+    public SpellFixer(Dictionaries dicts, Frequencies freq, Rules rules)
     {
         _dicts = dicts;
         _freq = freq;
-        _auto = auto;
-        _exceptions = exceptions;
+        _rules = rules;
     }
 
     private static readonly bool FixDebug = Environment.GetEnvironmentVariable("SWITCHER_FIXDEBUG") == "1";
@@ -107,7 +70,8 @@ public sealed class SpellFixer
     public Decision FixEither(string typed, IntPtr layout, string alt, IntPtr other, bool allowSwitch, int contextLang = 0)
     {
         if (!allowSwitch || other == IntPtr.Zero || alt.Length == 0) return Fix(typed, layout);
-        var typedTask = Task.Run(() => Fix(typed, layout));
+        var scope = RuleScope.Current; // thread-static: carry it into the pool thread
+        var typedTask = Task.Run(() => { RuleScope.Current = scope; return Fix(typed, layout); });
         var asAlt = Fix(alt, other);
         var asTyped = typedTask.GetAwaiter().GetResult();
         // two guesses stacked (wrong layout AND a typo) must be convincing: a good score and a real-sized word
@@ -141,7 +105,7 @@ public sealed class SpellFixer
         var lower = core.ToLowerInvariant();
 
         // explicit rules first — they may target hyphenated or dictionary words ("всё-же", "ихний")
-        if (core.Length > 0 && _auto.TryGet(lower, out var explicitFix) && !_exceptions.IsBlocked(lower, explicitFix))
+        if (core.Length > 0 && _rules.TryAutocorrect(lower, out var explicitFix) && !_rules.IsBlocked(lower, explicitFix))
             return Result(core, explicitFix, prefix, suffix, lang, "autocorrect", 0);
         if (core.Length < 3 || !Corrector.IsPureLetters(core)) return Decision.Keep;
 
@@ -180,7 +144,7 @@ public sealed class SpellFixer
         void Add(string word, double? fixedCost = null)
         {
             var w = EditCost.Normalize(word.ToLowerInvariant());
-            if (w == norm || _exceptions.IsBlocked(norm, w)) return; // the user rejected this very replacement before
+            if (w == norm) return;
             double cost = fixedCost ?? EditCost.Distance(norm, w, lang, hkl);
             if (seen.TryGetValue(w, out var idx))
             {
@@ -249,7 +213,12 @@ public sealed class SpellFixer
 
         if (cands.Count == 0) return null;
         cands.Sort((a, b) => a.Score.CompareTo(b.Score));
-        var best = cands[0];
+        // A replacement the user has rejected before (undo) is skipped — but if the runner-up is clearly worse than
+        // the rejected favourite, the user most likely wants the word left alone, not a worse guess.
+        int firstOk = cands.FindIndex(c => !_rules.IsBlocked(norm, EditCost.Normalize(c.Word.ToLowerInvariant())));
+        if (firstOk < 0) return null;
+        if (firstOk > 0 && cands[firstOk].Score > cands[0].Score + 0.05) return null; // only a near-tie may step in
+        var best = cands[firstOk];
 
         int len = norm.Length;
         // longer words tolerate two edits; short ones collide with too much

@@ -7,7 +7,7 @@ namespace Switcher;
 public sealed class Engine : IDisposable
 {
     private readonly Settings _settings;
-    private readonly Exceptions _exceptions;
+    private readonly Rules _exceptions;
     private readonly Dictionaries _dicts;
     private readonly Corrector _corrector;
     private readonly SpellFixer _speller;
@@ -34,7 +34,17 @@ public sealed class Engine : IDisposable
     private void OnTrigger() => DrainDeferred();
     private readonly KeyboardHook _hook;
     private readonly WordTracker _word = new();
-    private readonly Hotkey _hotkey;
+    private Hotkey _hotkey;
+    /// <summary>Re-read the hotkey from settings (the settings window changed it).</summary>
+    public void ReloadHotkey() => _hotkey = Hotkey.Parse(_settings.Hotkey);
+
+    /// <summary>Temporary pause from the tray menu / settings window; DateTime.MinValue = not paused.</summary>
+    public DateTime PausedUntil { get; set; } = DateTime.MinValue;
+    public bool IsPaused => DateTime.UtcNow < PausedUntil;
+
+    /// <summary>Raised (on a worker thread) when the same word's correction was undone often enough to offer it as a personal word.</summary>
+    public event Action<string>? SuggestWord;
+    private readonly HashSet<string> _suggested = new(StringComparer.OrdinalIgnoreCase);
     private readonly PasswordDetector _passwords = new();
     private readonly Dictionary<uint, string> _processNames = new();
     private readonly object _lock = new();
@@ -71,13 +81,13 @@ public sealed class Engine : IDisposable
 
     public event Action<string>? Notify;
 
-    public Engine(Settings settings, Exceptions exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller, Autocorrect autocorrect)
+    public Engine(Settings settings, Rules exceptions, Dictionaries dicts, Frequencies freq, SpellFixer speller)
     {
         _speller = speller;
         _settings = settings;
         _exceptions = exceptions;
         _dicts = dicts;
-        _corrector = new Corrector(dicts, exceptions, settings, freq, autocorrect);
+        _corrector = new Corrector(dicts, exceptions, settings, freq);
         _hotkey = Hotkey.Parse(settings.Hotkey);
         _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = () => { Invalidate(); _passwords.Touch(Native.GetForegroundWindow()); }, Trigger = OnTrigger };
     }
@@ -98,7 +108,7 @@ public sealed class Engine : IDisposable
 
         uint vk = e.Vk;
 
-        if (_hotkey.Matches(vk) && _settings.Enabled && Ready)
+        if (_hotkey.Matches(vk) && _settings.Enabled && Ready && !IsPaused)
         {
             if (_passwords.IsPasswordField(Native.GetForegroundWindow())) return true; // swallow, but never touch a password
             // snapshot on the hook thread, act on a worker thread
@@ -115,7 +125,7 @@ public sealed class Engine : IDisposable
             return true;
         }
 
-        if (!_settings.Enabled || !Ready || _disposed) return false;
+        if (!_settings.Enabled || !Ready || _disposed || IsPaused) return false;
 
         // A modifier pressed on its own (Alt+Shift, Ctrl+Shift, Win — the layout switch itself) keeps the word;
         // a real key with Ctrl/Alt/Win held is a shortcut and abandons it. Win+Space is the layout switch too.
@@ -202,6 +212,7 @@ public sealed class Engine : IDisposable
     {
         var oldLayout = _word.Layout;
         var keys = _word.Snapshot();
+        RuleScope.Current = ProcessName(hwnd);
         int oldLang = Native.LangId(oldLayout), newLang = Native.LangId(newLayout);
         string typed = WordTracker.Render(keys, oldLayout);
         string flipped = WordTracker.Render(keys, newLayout);
@@ -263,6 +274,7 @@ public sealed class Engine : IDisposable
         int altLang = Native.LangId(other);
 
         int ctx = ContextFor(hwnd);
+        RuleScope.Current = ProcessName(hwnd); // app-specific rules apply on this thread from here on
         var decision = _corrector.Decide(typed, typedLang, alt, altLang, hasDigits, ctx);
         if (Debug) Log.Write($"decide '{typed}' ctx={Corrector.LangName(ctx)} → {decision.Kind} {decision.Reason}");
 
@@ -293,7 +305,7 @@ public sealed class Engine : IDisposable
                 bool hold = boundaryVk != Native.VK_SPACE;
                 string boundary = boundaryVk switch { Native.VK_RETURN => "\n", Native.VK_TAB => "\t", _ => " " };
                 var focus = Injector.FocusWindow(hwnd);
-                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, hold, boundary, epoch, ctx));
+                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, hold, boundary, epoch, ctx, RuleScope.Current));
                 return hold;
         }
         return false;
@@ -302,7 +314,7 @@ public sealed class Engine : IDisposable
     // ------------------------------------------------------------------ spell-fix worker: one running, one pending
 
     private sealed record FixRequest(string Typed, IntPtr Layout, string Alt, IntPtr Other, IntPtr Hwnd, IntPtr Focus,
-        int BoundaryVk, bool Hold, string Boundary, int Epoch, int Ctx);
+        int BoundaryVk, bool Hold, string Boundary, int Epoch, int Ctx, string Scope);
 
     private FixRequest? _pendingFix;
     private readonly SemaphoreSlim _fixSignal = new(0);
@@ -331,6 +343,7 @@ public sealed class Engine : IDisposable
             SafeRun(() =>
             {
                 if (Volatile.Read(ref _epoch) != r.Epoch) { if (Debug) Log.Write($"fix '{r.Typed}' stale before start"); if (r.Hold) Injector.PressKey(r.BoundaryVk); return; }
+                RuleScope.Current = r.Scope;
                 var fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
                 RunInHook(() => ApplyFix(fix, r.Typed, r.Layout, r.Alt, r.Other, r.Hwnd, r.Focus, r.BoundaryVk, r.Hold, r.Boundary, r.Epoch));
             });
@@ -453,9 +466,11 @@ public sealed class Engine : IDisposable
             var to = Corrector.StripPunctuation(last.Text, out _, out _);
             ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
             {
-                bool learned = _exceptions.Reject(from, to);
-                Report(learned ? $"[undo] {last.Text} → {last.AltText}; '{from}' добавлено в личный словарь после {Exceptions.UndosToLearnWord} отмен"
-                               : $"[undo] {last.Text} → {last.AltText}; замена '{from}' → '{to}' больше не предлагается");
+                int n = _exceptions.Reject(from, to);
+                Report($"[undo] {last.Text} → {last.AltText}; замена '{from}' → '{to}' больше не предлагается");
+                bool ask;
+                lock (_lock) ask = n >= Rules.UndosToSuggest && !_exceptions.Contains(from) && _suggested.Add(from);
+                if (ask) SuggestWord?.Invoke(from); // the tray asks the user; nothing is learned silently
             }));
         }
         else
@@ -470,18 +485,28 @@ public sealed class Engine : IDisposable
 
     private static readonly bool IgnoreExclusions = Environment.GetEnvironmentVariable("SWITCHER_NO_EXCLUDE") == "1";
 
+    /// <summary>Process name (without .exe) of a window, cached per pid.</summary>
+    public string ProcessName(IntPtr hwnd)
+    {
+        Native.GetWindowThreadProcessId(hwnd, out uint pid);
+        if (pid == 0) return "";
+        lock (_processNames)
+        {
+            if (!_processNames.TryGetValue(pid, out var name))
+            {
+                try { name = Process.GetProcessById((int)pid).ProcessName; }
+                catch { name = ""; }
+                if (_processNames.Count > 256) _processNames.Clear();
+                _processNames[pid] = name;
+            }
+            return name;
+        }
+    }
+
     private bool IsExcluded(IntPtr hwnd)
     {
         if (IgnoreExclusions || _settings.ExcludedProcesses.Count == 0) return false;
-        Native.GetWindowThreadProcessId(hwnd, out uint pid);
-        if (pid == 0) return false;
-        if (!_processNames.TryGetValue(pid, out var name))
-        {
-            try { name = Process.GetProcessById((int)pid).ProcessName; }
-            catch { name = ""; }
-            if (_processNames.Count > 256) _processNames.Clear();
-            _processNames[pid] = name;
-        }
+        var name = ProcessName(hwnd);
         foreach (var ex in _settings.ExcludedProcesses)
             if (string.Equals(ex, name, StringComparison.OrdinalIgnoreCase)) return true;
         return false;

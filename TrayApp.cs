@@ -13,7 +13,7 @@ public sealed class TrayApp : ApplicationContext
     private const string RunName = "Switcher";
 
     private readonly Settings _settings;
-    private readonly Exceptions _exceptions;
+    private readonly Rules _exceptions;
     private readonly Dictionaries _dicts = new();
     private readonly Frequencies _freq = new();
     private readonly NotifyIcon _icon;
@@ -21,13 +21,53 @@ public sealed class TrayApp : ApplicationContext
     private readonly Icon _iconOff;
     private Engine? _engine;
 
-    private ToolStripMenuItem _miEnabled = null!, _miSwitch = null!, _miSpell = null!, _miBeep = null!, _miLog = null!, _miAutostart = null!, _miStatus = null!;
+    private ToolStripMenuItem _miEnabled = null!, _miSwitch = null!, _miSpell = null!, _miBeep = null!, _miLog = null!, _miAutostart = null!, _miStatus = null!, _miPause = null!;
+    private SettingsForm? _settingsForm;
+    private string? _offeredWord;
+    private System.Windows.Forms.Timer? _pauseTimer;
+
+    private void OpenSettings(int tab)
+    {
+        if (_engine == null) return;
+        if (_settingsForm == null || _settingsForm.IsDisposed)
+        {
+            _settingsForm = new SettingsForm(_settings, _exceptions, _engine, UpdateUi, tab);
+            _settingsForm.Icon = _iconOn;
+        }
+        _settingsForm.Show();
+        _settingsForm.Activate();
+    }
+
+    private void Pause(int minutes)
+    {
+        if (_engine == null) return;
+        _engine.PausedUntil = minutes > 0 ? DateTime.UtcNow.AddMinutes(minutes) : DateTime.MinValue;
+        _pauseTimer ??= new System.Windows.Forms.Timer { Interval = 30_000 };
+        _pauseTimer.Tick -= PauseTick; _pauseTimer.Tick += PauseTick;
+        _pauseTimer.Enabled = minutes > 0;
+        UpdateUi();
+    }
+
+    private void PauseTick(object? s, EventArgs e)
+    {
+        if (_engine != null && !_engine.IsPaused) { _pauseTimer!.Enabled = false; UpdateUi(); }
+    }
+
+    /// <summary>The same word's correction was undone several times: ask (a balloon) before making it a personal word.</summary>
+    private void OfferWord(string word)
+    {
+        _offeredWord = word;
+        _icon.BalloonTipTitle = "Switcher";
+        _icon.BalloonTipText = $"Вы {Rules.UndosToSuggest} раза отменяли исправление слова «{word}». Нажмите, чтобы добавить его в личный словарь — тогда оно не будет исправляться.";
+        _icon.BalloonTipIcon = ToolTipIcon.Info;
+        _icon.ShowBalloonTip(10_000);
+    }
 
     public TrayApp()
     {
         _settings = Settings.Load();
         Log.Enabled = true;
-        _exceptions = new Exceptions();
+        _exceptions = new Rules();
 
         _iconOn = MakeIcon(Color.FromArgb(0x2B, 0x8A, 0x3E));
         _iconOff = MakeIcon(Color.FromArgb(0x80, 0x80, 0x80));
@@ -39,11 +79,18 @@ public sealed class TrayApp : ApplicationContext
             Visible = true,
             ContextMenuStrip = BuildMenu(),
         };
-        _icon.DoubleClick += (_, _) => ToggleEnabled();
+        _icon.DoubleClick += (_, _) => OpenSettings(0);
+        _icon.BalloonTipClicked += (_, _) =>
+        {
+            var w = _offeredWord; _offeredWord = null;
+            if (w == null) return;
+            _exceptions.AddWord(w);
+            Log.Write($"'{w}' добавлено в личный словарь по подтверждению пользователя");
+        };
 
-        var autocorrect = new Autocorrect();
-        var speller = new SpellFixer(_dicts, _freq, autocorrect, _exceptions);
-        _engine = new Engine(_settings, _exceptions, _dicts, _freq, speller, autocorrect);
+        var speller = new SpellFixer(_dicts, _freq, _exceptions);
+        _engine = new Engine(_settings, _exceptions, _dicts, _freq, speller);
+        _engine.SuggestWord += word => BeginInvokeUi(() => OfferWord(word));
         _engine.Notify += _ => { };
         try
         {
@@ -78,7 +125,15 @@ public sealed class TrayApp : ApplicationContext
         menu.Items.Add(_miStatus);
         menu.Items.Add(new ToolStripSeparator());
 
+        Add(menu, "Настройки…", () => OpenSettings(0));
+        Add(menu, "Обучение (личные слова, отклонённые замены)…", () => OpenSettings(2));
+        menu.Items.Add(new ToolStripSeparator());
         _miEnabled = Add(menu, "Включено", ToggleEnabled);
+        _miPause = new ToolStripMenuItem("Пауза");
+        _miPause.DropDownItems.Add("На 15 минут", null, (_, _) => Pause(15));
+        _miPause.DropDownItems.Add("На 1 час", null, (_, _) => Pause(60));
+        _miPause.DropDownItems.Add("Возобновить", null, (_, _) => Pause(0));
+        menu.Items.Add(_miPause);
         _miSwitch = Add(menu, "Автопереключение раскладки", () => { _settings.AutoSwitchLayout = !_settings.AutoSwitchLayout; Save(); });
         _miSpell = Add(menu, "Автоисправление опечаток", () => { _settings.AutoFixSpelling = !_settings.AutoFixSpelling; Save(); });
         _miBeep = Add(menu, "Звук при исправлении", () => { _settings.Beep = !_settings.Beep; Save(); });
@@ -87,9 +142,9 @@ public sealed class TrayApp : ApplicationContext
         _miAutostart = Add(menu, "Запускать при входе в Windows", () => { SetAutostart(!IsAutostart()); UpdateUi(); });
         menu.Items.Add(new ToolStripSeparator());
         Add(menu, "Открыть настройки (settings.json)", () => Open(Settings.FilePath));
-        Add(menu, "Открыть автозамены (autocorrect.txt)", () => { EnsureFile(Autocorrect.UserPath, "# что_набрано = на_что_заменить" + Environment.NewLine); Open(Autocorrect.UserPath); });
-        Add(menu, "Открыть отклонённые замены (blocked.txt)", () => { EnsureFile(Exceptions.BlockedPath, "# что_было = на_что_не_менять" + Environment.NewLine); Open(Exceptions.BlockedPath); });
-        Add(menu, "Открыть исключения (exceptions.txt)", () => { EnsureFile(Settings.ExceptionsPath, "# слова, которые не трогать — по одному на строку\n"); Open(Settings.ExceptionsPath); });
+        Add(menu, "Открыть автозамены (autocorrect.txt)", () => { EnsureFile(Rules.AutocorrectPath, "# что_набрано = на_что_заменить" + Environment.NewLine); Open(Rules.AutocorrectPath); });
+        Add(menu, "Открыть отклонённые замены (blocked.txt)", () => { EnsureFile(Rules.BlockedPath, "# что_было = на_что_не_менять" + Environment.NewLine); Open(Rules.BlockedPath); });
+        Add(menu, "Открыть исключения (exceptions.txt)", () => { EnsureFile(Rules.WordsPath, "# слова, которые не трогать — по одному на строку\n"); Open(Rules.WordsPath); });
         Add(menu, "Открыть лог", () => { EnsureFile(Settings.LogPath, ""); Open(Settings.LogPath); });
         Add(menu, "Открыть папку программы", () => Open(AppContext.BaseDirectory));
         Add(menu, "Перезапустить (перечитать настройки и списки)", Restart);
@@ -123,8 +178,12 @@ public sealed class TrayApp : ApplicationContext
         bool on = _settings.Enabled;
         _icon.Icon = on ? _iconOn : _iconOff;
         var hk = _settings.Hotkey;
+        bool paused = _engine?.IsPaused == true;
+        _icon.Icon = on && !paused ? _iconOn : _iconOff;
         _icon.Text = !_dicts.IsLoaded ? "Switcher — загрузка словарей…"
+                   : paused ? $"Switcher — пауза до {_engine!.PausedUntil.ToLocalTime():HH:mm}"
                    : on ? $"Switcher — работает ({hk}: переключить/отменить)" : "Switcher — выключен";
+        if (_miPause != null) _miPause.Text = paused ? $"Пауза (до {_engine!.PausedUntil.ToLocalTime():HH:mm})" : "Пауза";
         _miStatus.Text = _dicts.IsLoaded ? $"Switcher v{Version}" : "Switcher — загрузка словарей…";
         _miEnabled.Checked = on;
         _miSwitch.Checked = _settings.AutoSwitchLayout;

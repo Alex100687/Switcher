@@ -10,6 +10,8 @@ internal static class Program
     {
         if (args.Length > 0 && args[0] == "--test")
             return SelfTest.Run(args.Skip(1).ToArray());
+        if (args.Length > 1 && args[0] == "--ui-smoke")
+            return SelfTest.UiSmoke(args[1]);
 
         // "--wait-for <pid>": started by Restart — let the previous instance release the mutex first
         int w = Array.IndexOf(args, "--wait-for");
@@ -42,6 +44,28 @@ internal static class SelfTest
 {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern short VkKeyScanExW(char ch, IntPtr dwhkl);
 
+    /// <summary>Open every tab of the settings window off-screen and save screenshots — a layout check without a human.</summary>
+    public static int UiSmoke(string pngPrefix)
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        var settings = Settings.Load();
+        var rules = new Rules();
+        var dicts = new Dictionaries(); var freq = new Frequencies();
+        var engine = new Engine(settings, rules, dicts, freq, new SpellFixer(dicts, freq, rules)); // hook is not installed without Start()
+        for (int tab = 0; tab < 3; tab++)
+        {
+            using var f = new SettingsForm(settings, rules, engine, () => { }, tab) { StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(-4000, -4000) };
+            f.Show();
+            for (int i = 0; i < 20; i++) { Application.DoEvents(); Thread.Sleep(25); }
+            using var bmp = new System.Drawing.Bitmap(f.Width, f.Height);
+            f.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, f.Width, f.Height));
+            bmp.Save($"{pngPrefix}-{tab}.png", System.Drawing.Imaging.ImageFormat.Png);
+            f.Close();
+        }
+        return 0;
+    }
+
     public static int Run(string[] words)
     {
         Native.AttachConsole(-1);
@@ -49,16 +73,16 @@ internal static class SelfTest
         Console.WriteLine();
 
         var settings = Settings.Load();
-        var exceptions = new Exceptions();
+        var rules = new Rules();
         var dicts = new Dictionaries();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         dicts.Load();
         var freq = new Frequencies(); freq.Load();
         Console.WriteLine($"dictionaries: {sw.ElapsedMilliseconds} ms");
-        var autocorrect = new Autocorrect();
-        var corrector = new Corrector(dicts, exceptions, settings, freq, autocorrect);
-        var speller = new SpellFixer(dicts, freq, autocorrect, exceptions);
+        var corrector = new Corrector(dicts, rules, settings, freq);
+        var speller = new SpellFixer(dicts, freq, rules);
 
+        RuleScope.Current = Environment.GetEnvironmentVariable("SWITCHER_TEST_SCOPE") ?? "";
         var layouts = Layouts.Installed();
         Console.WriteLine("layouts: " + string.Join(", ", layouts.Select(h => $"{Layouts.Name(h)} ({(long)h:X8})")));
         var ru = layouts.FirstOrDefault(h => Native.LangId(h) == Dictionaries.LangRu);

@@ -265,17 +265,22 @@ public sealed class Corrector
     public static bool IsSlipPattern(string s) => IsTwoCaps(s) || IsInvertedCaps(s);
 
     /// <summary>
-    /// Can a fix of a shift-slip word be explained by the fingers? Either the first key was pressed twice ("ППривет" →
-    /// "Привет"), or the capitals were real letters of the word and one cheap slip came after ("ПРивте" → "Привет").
-    /// Not "ПКшка" → "Пушка" (the К is not a letter of "пушка") nor "ДРшка" → "Драка" (two edits): those are
-    /// abbreviations with a suffix.
+    /// Can a fix of a shift-slip word be explained by the fingers? The first key may have been pressed twice ("ППривет"
+    /// → "Привет"); what remains must then be the word itself, its first two letters kept, with at most one cheap slip
+    /// after them ("ПРивте" → "Привет", "ППривед" → "Привет"). Not "ПКшка" → "Пушка" (the К is not a letter of
+    /// "пушка") nor "ДРшка" → "Драка" (two edits): those are abbreviations with a suffix.
     /// </summary>
     private static bool FitsShiftSlip(string original, string fixedCore, double cost)
     {
         var o = original.ToLowerInvariant();
         var f = fixedCore.ToLowerInvariant();
-        if (o.Length >= 3 && o[0] == o[1] && f == o[1..]) return true;
-        return cost <= 0.75 && f.Length >= 2 && f[..2] == o[..2];
+        if (o.Length >= 3 && o[0] == o[1])
+        {
+            o = o[1..];                 // the doubled first key
+            cost -= EditCost.Cheap;     // what the fixer paid for dropping it
+            if (f == o) return true;
+        }
+        return cost <= 0.75 && f.Length >= 2 && o.Length >= 2 && f[..2] == o[..2];
     }
 
     /// <summary>First letter small, all the others capital: Caps Lock was on and Shift pressed for the capital ("пРИВЕТ").</summary>

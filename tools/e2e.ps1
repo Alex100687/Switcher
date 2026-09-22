@@ -157,6 +157,7 @@ Step "enter boundary"   $en "ntrcn{ENTER}"   "текст`r`n"
 # 0.5.0: letter case, spaces, words before, editing
 Step "two caps"           $ru "ПОжалуйста "      "Пожалуйста "
 Step "first key twice"    $ru "ППривет "         "Привет "
+Step "twice + typo"       $ru "ППривед "         "Привет "
 Step "two caps + typo"    $ru "ПРивте "          "Привет "
 Step "proper noun"        $ru "москва "          "Москва "
 Step "abbreviation"       $ru "сша "             "США "

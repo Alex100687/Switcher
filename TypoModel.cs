@@ -1,9 +1,8 @@
 namespace Switcher;
 
 /// <summary>
-/// Decides whether <c>typed</c> is a *mechanically plausible* fast-typing slip of <c>correct</c>:
-/// two adjacent letters swapped, one letter missed, one letter doubled, or a neighbouring key hit instead.
-/// Anything else (a random extra letter, a far-away substitution) is more likely a word we simply don't know.
+/// Physical keyboard geometry: which keys touch. <see cref="EditCost"/> prices "hit the neighbouring key" lower than
+/// a random substitution — a typical fast-typing slip.
 /// </summary>
 public static class TypoModel
 {
@@ -25,59 +24,6 @@ public static class TypoModel
             for (int c = 0; c < Rows[r].Length; c++)
                 g[Rows[r][c]] = (r, c);
         return g;
-    }
-
-    public static bool IsPlausible(string typed, string correct, IntPtr hkl)
-    {
-        typed = typed.ToLowerInvariant();
-        correct = correct.ToLowerInvariant();
-        if (typed == correct) return false;
-
-        int n = typed.Length, m = correct.Length;
-
-        if (n == m)
-        {
-            // find first and last differing positions
-            int first = -1, last = -1;
-            for (int i = 0; i < n; i++)
-                if (typed[i] != correct[i]) { if (first < 0) first = i; last = i; }
-            if (first < 0) return false;
-
-            if (first == last)
-                return AreNeighbours(typed[first], correct[first], hkl);          // adjacent-key slip
-
-            if (last == first + 1 && typed[first] == correct[last] && typed[last] == correct[first])
-                return true;                                                       // transposition
-
-            return false;
-        }
-
-        if (m == n + 1)
-        {
-            // one letter missed: correct with one char removed equals typed
-            return RemoveOneEquals(correct, typed);
-        }
-
-        if (n == m + 1)
-        {
-            // one extra letter — accept only if it doubles a neighbouring letter ("helllo")
-            for (int i = 0; i < n; i++)
-            {
-                if (typed.Remove(i, 1) != correct) continue;
-                bool doubles = (i > 0 && typed[i - 1] == typed[i]) || (i + 1 < n && typed[i + 1] == typed[i]);
-                return doubles;
-            }
-            return false;
-        }
-
-        return false;
-    }
-
-    private static bool RemoveOneEquals(string longer, string shorter)
-    {
-        int i = 0;
-        while (i < shorter.Length && longer[i] == shorter[i]) i++;
-        return string.CompareOrdinal(longer, i + 1, shorter, i, shorter.Length - i) == 0;
     }
 
     /// <summary>Two characters are neighbours if their physical keys (in the given layout) touch on the keyboard.</summary>

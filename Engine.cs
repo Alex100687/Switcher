@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Windows.Forms;
 
 namespace Switcher;
@@ -46,7 +45,6 @@ public sealed class Engine : IDisposable
     public event Action<string>? SuggestWord;
     private readonly HashSet<string> _suggested = new(StringComparer.OrdinalIgnoreCase);
     private readonly PasswordDetector _passwords = new();
-    private readonly Dictionary<uint, string> _processNames = new();
     private readonly object _lock = new();
 
     /// <summary>
@@ -55,8 +53,17 @@ public sealed class Engine : IDisposable
     /// A pending spell fix compares it to know whether it still knows what is on screen.
     /// </summary>
     private int _epoch;
-    /// <summary>Anything that moves the caret also forfeits the undo of the last word: Pause must never erase text elsewhere.</summary>
-    private void Invalidate() { Interlocked.Increment(ref _epoch); _word.Reset(); lock (_lock) _last = null; }
+    /// <summary>
+    /// Anything that moves the caret also forfeits the undo of the last word (Pause must never erase text elsewhere)
+    /// and the password answer (the caret may now be in another field of the same window).
+    /// </summary>
+    private void Invalidate()
+    {
+        Interlocked.Increment(ref _epoch);
+        _word.Reset();
+        lock (_lock) _last = null;
+        _passwords.Forget();
+    }
 
     /// <summary>Set by the host once dictionaries, frequencies and the warm-up are done; nothing is processed before.</summary>
     public volatile bool Ready;
@@ -74,10 +81,68 @@ public sealed class Engine : IDisposable
         }
     }
 
-    /// <summary>The last finished word — what is on screen now and what it would be in the other layout.</summary>
+    /// <summary>
+    /// The last finished word — what is on screen now and what it would be in the other layout.
+    /// <paramref name="TypedCore"/> is the word as the user typed it (what an undo restores and what may become a
+    /// personal word); <paramref name="RejectFrom"/> is the form the corrector saw when it chose the replacement —
+    /// for a fix in the other layout that is the other layout's rendering (";spym" was fixed as "жызнь" → "жизнь").
+    /// </summary>
     private sealed record LastWord(string Text, IntPtr Layout, string AltText, IntPtr AltLayout,
-        int TrailingVk, IntPtr Hwnd, DateTime Time, bool WasAuto, string OriginalCore);
+        int TrailingVk, IntPtr Hwnd, DateTime Time, bool WasAuto, string TypedCore, string RejectFrom);
     private LastWord? _last;
+
+    /// <summary>
+    /// An Enter/Tab held back while its word's spelling fix is computed (in a chat Enter would send the unfixed word).
+    /// Exactly one party delivers it: the fix (together with the corrected word), or — if the user presses another
+    /// non-letter key or clicks first — that key's callback, right before the key, so the text keeps its order.
+    /// </summary>
+    private sealed class HeldBoundary(int vk, string text, IntPtr hwnd)
+    {
+        public int Vk { get; } = vk;
+        public string Text { get; } = text;
+        public IntPtr Hwnd { get; } = hwnd;
+        private int _claimed;
+        public bool TryClaim() => Interlocked.Exchange(ref _claimed, 1) == 0;
+    }
+    private HeldBoundary? _held;
+
+    /// <summary>Become the one who delivers (or deliberately drops) the held key.</summary>
+    private bool TakeHeld(HeldBoundary h)
+    {
+        if (!h.TryClaim()) return false;
+        Interlocked.CompareExchange(ref _held, null, h);
+        return true;
+    }
+
+    /// <summary>
+    /// Inside a hardware key/click callback: the held Enter/Tab goes in now, before this key. Letters of the next word
+    /// typed meanwhile are already on screen in front of it, so they are erased and retyped after it.
+    /// </summary>
+    private void ReleaseHeld()
+    {
+        var h = Volatile.Read(ref _held);
+        if (h == null || !TakeHeld(h)) return;
+        if (Native.GetForegroundWindow() != h.Hwnd) { Log.Write("held key dropped: focus moved"); return; }
+        if (_word.TryPending(h.Hwnd, out var pending, out var layout) && pending.Count > 0)
+        {
+            string letters = WordTracker.Render(pending, layout);
+            Injector.Replace(letters.Length, h.Text + letters);
+        }
+        else Injector.PressKey(h.Vk);
+        if (Debug) Log.Write("held key delivered before the next key; its fix is abandoned");
+    }
+
+    /// <summary>Fallback delivery of a held key whose fix will not happen (stale, failed) — on the hook thread, only into its own window.</summary>
+    private void DeliverHeldLater(HeldBoundary? h)
+    {
+        if (h == null) return;
+        RunInHook(() =>
+        {
+            if (!TakeHeld(h)) return;
+            if (Native.GetForegroundWindow() == h.Hwnd) Injector.PressKey(h.Vk);
+            else Log.Write("held key dropped: focus moved");
+        });
+    }
 
     public event Action<string>? Notify;
 
@@ -89,7 +154,13 @@ public sealed class Engine : IDisposable
         _dicts = dicts;
         _corrector = new Corrector(dicts, exceptions, settings, freq);
         _hotkey = Hotkey.Parse(settings.Hotkey);
-        _hook = new KeyboardHook { KeyDown = OnKeyDown, MouseDown = () => { Invalidate(); _passwords.Touch(Native.GetForegroundWindow()); }, Trigger = OnTrigger };
+        _hook = new KeyboardHook
+        {
+            KeyDown = OnKeyDown,
+            MouseDown = OnMouseDown,
+            Trigger = OnTrigger,
+            InputHiddenFrom = h => Processes.Of(h).Elevated,
+        };
     }
 
     public void Start() => _hook.Install();
@@ -98,21 +169,39 @@ public sealed class Engine : IDisposable
 
     private static readonly bool Debug = Environment.GetEnvironmentVariable("SWITCHER_DEBUG") == "1";
 
+    private void OnMouseDown()
+    {
+        ReleaseHeld(); // the click has not reached the app yet: a held Enter still lands where it was pressed
+        Invalidate();
+        _passwords.Touch(Native.GetForegroundWindow());
+    }
+
     private bool OnKeyDown(KeyEventArgs e)
     {
-        if (Debug) Log.Write($"key vk={e.Vk:X2} scan={e.Scan:X2} injected={e.Injected} fg={Native.GetForegroundWindow():X} layout={(long)Layouts.Current(Native.GetForegroundWindow()):X8} buf={_word.Count}");
-        if (e.Injected) return false; // our own output (or another tool's) — never react to it
-
-        Volatile.Write(ref _lastHardwareKeyTicks, DateTime.UtcNow.Ticks);
-        if (KeyboardHook.InHardwareCallback && !_deferred.IsEmpty) DrainDeferred(); // a ready fix goes in ahead of this key
+        if (Debug) Log.Write($"key vk={e.Vk:X2} scan={e.Scan:X2} injected={e.Injected} foreign={e.Foreign} fg={Native.GetForegroundWindow():X} layout={(long)Layouts.Current(Native.GetForegroundWindow()):X8} buf={_word.Count}");
+        if (e.Injected)
+        {
+            // Another program typed into the field (auto-type, a macro, another switcher): the buffer no longer
+            // matches the screen, and erasing "our" word would erase theirs.
+            if (e.Foreign && !IsModifierKey(e.Vk)) Invalidate();
+            return false; // our own output — never react to it
+        }
 
         uint vk = e.Vk;
+        Volatile.Write(ref _lastHardwareKeyTicks, DateTime.UtcNow.Ticks);
+        if (KeyboardHook.InHardwareCallback)
+        {
+            if (!_deferred.IsEmpty) DrainDeferred(); // a ready fix goes in ahead of this key
+            // a held Enter/Tab whose fix is still being computed goes in ahead of any key that is not a letter
+            if (!WordTracker.IsWordKey(vk) && !IsModifierKey(vk)) ReleaseHeld();
+        }
 
         if (_hotkey.Matches(vk) && _settings.Enabled && Ready && !IsPaused)
         {
-            if (_passwords.IsPasswordField(Native.GetForegroundWindow())) return true; // swallow, but never touch a password
-            // snapshot on the hook thread, act on a worker thread
             var hk = Native.GetForegroundWindow();
+            if (Processes.Of(hk).Elevated) return false; // our input would not reach it; let the key through
+            if (_passwords.IsPasswordField(hk)) return true; // swallow, but never touch a password
+            // snapshot on the hook thread, act on a worker thread
             IReadOnlyList<TypedKey>? keys = null;
             IntPtr wordLayout = IntPtr.Zero;
             if (!_word.IsEmpty && _word.Hwnd == hk)
@@ -166,10 +255,14 @@ public sealed class Engine : IDisposable
 
         if (vk is Native.VK_SPACE or Native.VK_RETURN or Native.VK_TAB)
         {
-            if (_word.IsEmpty) return false;
+            // A second space, an empty line: the last word is no longer right before the caret — neither an undo
+            // nor a pending fix may count characters back from here.
+            if (_word.IsEmpty) { Invalidate(); return false; }
             // Shift+Enter etc. — let it through untouched, but the word is finished.
             if (vk != Native.VK_SPACE && Native.IsDown(Native.VK_SHIFT)) { Invalidate(); return false; }
-            return OnWordBoundary((int)vk, hwnd);
+            bool swallowed = OnWordBoundary((int)vk, hwnd);
+            if (vk != Native.VK_SPACE) _passwords.Forget(); // Tab/Enter usually moves the caret to another field
+            return swallowed;
         }
 
         // navigation, escape, delete, function keys… — word is abandoned
@@ -219,13 +312,14 @@ public sealed class Engine : IDisposable
         var core = Corrector.StripPunctuation(typed, out _, out _);
         var flippedCore = Corrector.StripPunctuation(flipped, out _, out _);
 
-        bool flip = _settings.AutoSwitchLayout && !_word.HasDigits && !IsExcluded(hwnd)
+        bool flip = _settings.AutoSwitchLayout && !_word.HasDigits
                     && flippedCore.Length >= 2 && Corrector.IsWordShaped(flippedCore)
-                    && _corrector.IsKnown(newLang, flippedCore);
+                    && _corrector.IsKnown(newLang, flippedCore) && !_exceptions.IsBlocked(core, flippedCore);
         // a word in both languages ("ult"/"где", or an English word finished before switching for the Russian
         // that follows): same collision rule as on a word boundary — context, then frequency
         if (flip && Corrector.IsWordShaped(core) && _corrector.IsKnown(oldLang, core))
             flip = _corrector.PreferOther(core, oldLang, flippedCore, newLang, ContextFor(hwnd), out _);
+        if (flip && !CanRewrite(hwnd)) flip = false;
         if (Debug) Log.Write($"manual switch '{typed}' → '{flipped}' flip={flip}");
         if (flip && _passwords.IsPasswordField(hwnd)) flip = false;
         if (!flip) { Invalidate(); return false; }
@@ -262,8 +356,9 @@ public sealed class Engine : IDisposable
         bool hasDigits = _word.HasDigits;
         _word.Reset();
         int epoch = Interlocked.Increment(ref _epoch);
+        lock (_lock) _last = null; // the previous word is no longer right before the caret
 
-        if (other == IntPtr.Zero || IsExcluded(hwnd)) return false;
+        if (other == IntPtr.Zero || !CanRewrite(hwnd)) return false;
 
         string typed = WordTracker.Render(keys, layout);
         string alt = WordTracker.Render(keys, other);
@@ -292,7 +387,7 @@ public sealed class Engine : IDisposable
                 SwitchLayoutVerified(hwnd, other);
                 var sws = System.Diagnostics.Stopwatch.StartNew();
                 Injector.Replace(typed.Length, alt, boundaryVk);
-                Log.Write($"  sync Replace took {sws.ElapsedMilliseconds} ms inCallback={KeyboardHook.InCallback}");
+                if (Debug) Log.Write($"  sync Replace took {sws.ElapsedMilliseconds} ms inCallback={KeyboardHook.InCallback}");
                 SetContext(hwnd, altLang);
                 Remember(alt, other, typed, layout, boundaryVk, hwnd, wasAuto: true);
                 ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {alt}  [{decision.Reason}]")));
@@ -302,11 +397,16 @@ public sealed class Engine : IDisposable
                 if (_passwords.IsPasswordField(hwnd)) return false;
                 // Suggest takes ~100 ms, so this runs on a worker. A space goes through to the app right away
                 // (no typing lag); Enter/Tab are held back, because in a chat Enter would send the unfixed word.
-                bool hold = boundaryVk != Native.VK_SPACE;
                 string boundary = boundaryVk switch { Native.VK_RETURN => "\n", Native.VK_TAB => "\t", _ => " " };
+                HeldBoundary? held = boundaryVk != Native.VK_SPACE ? new HeldBoundary(boundaryVk, boundary, hwnd) : null;
+                if (held != null)
+                {
+                    var previous = Interlocked.Exchange(ref _held, held);
+                    if (previous != null && TakeHeld(previous)) Injector.PressKey(previous.Vk); // never lose a user's key
+                }
                 var focus = Injector.FocusWindow(hwnd);
-                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, hold, boundary, epoch, ctx, RuleScope.Current));
-                return hold;
+                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, held, boundary, epoch, ctx, RuleScope.Current));
+                return held != null;
         }
         return false;
     }
@@ -314,7 +414,7 @@ public sealed class Engine : IDisposable
     // ------------------------------------------------------------------ spell-fix worker: one running, one pending
 
     private sealed record FixRequest(string Typed, IntPtr Layout, string Alt, IntPtr Other, IntPtr Hwnd, IntPtr Focus,
-        int BoundaryVk, bool Hold, string Boundary, int Epoch, int Ctx, string Scope);
+        int BoundaryVk, HeldBoundary? Held, string Boundary, int Epoch, int Ctx, string Scope);
 
     private FixRequest? _pendingFix;
     private readonly SemaphoreSlim _fixSignal = new(0);
@@ -324,7 +424,7 @@ public sealed class Engine : IDisposable
     private void SubmitFix(FixRequest r)
     {
         var replaced = Interlocked.Exchange(ref _pendingFix, r);
-        if (replaced != null && replaced.Hold) Injector.PressKey(replaced.BoundaryVk); // don't swallow its Enter/Tab
+        if (replaced?.Held != null && TakeHeld(replaced.Held)) Injector.PressKey(replaced.Held.Vk); // don't swallow its Enter/Tab
         if (_fixThread == null)
         {
             _fixThread = new Thread(FixWorker) { IsBackground = true, Name = "Switcher spell-fix" };
@@ -340,85 +440,105 @@ public sealed class Engine : IDisposable
             _fixSignal.Wait();
             var r = Interlocked.Exchange(ref _pendingFix, null);
             if (r == null) continue;
-            SafeRun(() =>
+            if (Volatile.Read(ref _epoch) != r.Epoch)
             {
-                if (Volatile.Read(ref _epoch) != r.Epoch) { if (Debug) Log.Write($"fix '{r.Typed}' stale before start"); if (r.Hold) Injector.PressKey(r.BoundaryVk); return; }
+                if (Debug) Log.Write($"fix '{r.Typed}' stale before start");
+                DeliverHeldLater(r.Held);
+                continue;
+            }
+            Decision fix;
+            try
+            {
                 RuleScope.Current = r.Scope;
-                var fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
-                RunInHook(() => ApplyFix(fix, r.Typed, r.Layout, r.Alt, r.Other, r.Hwnd, r.Focus, r.BoundaryVk, r.Hold, r.Boundary, r.Epoch));
-            });
+                fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
+            }
+            catch (Exception ex)
+            {
+                Log.Write("spell fix failed: " + ex);
+                DeliverHeldLater(r.Held); // a failed fix must not eat the user's Enter
+                continue;
+            }
+            RunInHook(() => ApplyFix(fix, r));
         }
     }
 
     /// <summary>Runs inside a hook callback: every earlier key has been seen, and our SendInput is queued atomically.</summary>
-    private void ApplyFix(Decision fix, string typed, IntPtr layout, string alt, IntPtr other, IntPtr hwnd, IntPtr focus,
-        int boundaryVk, bool hold, string boundary, int epoch)
+    private void ApplyFix(Decision fix, FixRequest r)
     {
-                // The world may have changed while we were thinking: the user switched windows or fields, turned the
-                // feature off, or the app is now excluded. Then nothing is typed anywhere — a held Enter/Tab is dropped
-                // rather than delivered to whatever has focus now.
-                if (_disposed || !_settings.Enabled || !_settings.AutoFixSpelling) { if (Debug) Log.Write("fix dropped: disabled"); return; }
-                if (Native.GetForegroundWindow() != hwnd || Injector.FocusWindow(hwnd) != focus) { Log.Write("fix dropped: focus moved"); return; }
-                if (IsExcluded(hwnd)) { if (Debug) Log.Write("fix dropped: excluded"); return; }
-                if (_passwords.IsPasswordField(hwnd)) { if (Debug) Log.Write("fix dropped: password/unknown field"); return; }
-                {
-                    bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != typed;
+        if (_disposed) return;
+        var held = r.Held;
+        // If the held Enter/Tab is gone, a later key or click has already delivered it in its place: the word is not
+        // the last thing before the caret any more (and after Enter the message may be sent).
+        if (held != null && !TakeHeld(held)) { if (Debug) Log.Write("fix dropped: held key already delivered"); return; }
+        void DeliverHeld() { if (held != null) Injector.PressKey(held.Vk); }
 
-                    // Meanwhile the user may have typed the first letters of the next word: fine, we erase and retype
-                    // them too (in the new layout if we switch). Anything else — another word finished, a click,
-                    // an arrow key, a different window — means we no longer know what is on screen: skip the fix.
-                    // The snapshot is re-taken right before SendInput so a keystroke landing in between is caught.
-                    IReadOnlyList<TypedKey> pending = Array.Empty<TypedKey>();
-                    IntPtr pendingLayout = IntPtr.Zero;
-                    var newLayout = fixing && fix.SwitchLayout ? other : layout;
-                    {
-                        bool known = Volatile.Read(ref _epoch) == epoch && _word.TryPending(hwnd, out pending, out pendingLayout);
-                        if (Debug) Log.Write($"fix '{typed}' → {fix.Kind} '{fix.NewText}' known={known} pending={pending.Count} epoch={epoch}/{_epoch}");
-                        if (!known)
-                        {
-                            if (hold) Injector.PressKey(boundaryVk); // best effort: at least deliver the held Enter/Tab
-                            return;
-                        }
-                        if (pendingLayout == IntPtr.Zero) pendingLayout = layout;
-                        string pendingOld = WordTracker.Render(pending, pendingLayout);
-                        string pendingNew = fixing && fix.SwitchLayout ? WordTracker.Render(pending, other) : pendingOld;
+        // The world may have changed while we were thinking. If the user switched windows or fields, nothing is
+        // typed anywhere — a held Enter/Tab is dropped rather than delivered to whatever has focus now. Otherwise
+        // (feature turned off, app excluded, password field) the word stays as it is and the held key goes through.
+        if (Native.GetForegroundWindow() != r.Hwnd || Injector.FocusWindow(r.Hwnd) != r.Focus) { Log.Write("fix dropped: focus moved"); return; }
+        if (!_settings.Enabled || !_settings.AutoFixSpelling) { if (Debug) Log.Write("fix dropped: disabled"); DeliverHeld(); return; }
+        if (!CanRewrite(r.Hwnd)) { if (Debug) Log.Write("fix dropped: window may not be rewritten"); DeliverHeld(); return; }
+        if (_passwords.IsPasswordField(r.Hwnd)) { if (Debug) Log.Write("fix dropped: password field"); DeliverHeld(); return; }
 
-                        int backspaces; string text;
-                        if (fixing)
-                        {
-                            backspaces = typed.Length + (hold ? 0 : 1) + pendingOld.Length;
-                            text = fix.NewText + boundary + pendingNew;
-                        }
-                        else if (hold) { backspaces = pendingOld.Length; text = boundary + pendingOld; } // held Enter/Tab goes before the new letters
-                        else { backspaces = 0; text = ""; }
+        bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != r.Typed;
+        bool hold = held != null;
 
-                        if (fixing && fix.SwitchLayout) { SwitchLayoutVerified(hwnd, other); _word.SetLayout(other); }
-                        if (backspaces > 0 || text.Length > 0)
-                        {
-                            var swi = System.Diagnostics.Stopwatch.StartNew();
-                            Injector.Replace(backspaces, text);
-                            if (Debug) Log.Write($"  Replace({backspaces}, '{text}') took {swi.ElapsedMilliseconds} ms on thread {Environment.CurrentManagedThreadId}");
-                        }
-                    }
+        // Meanwhile the user may have typed the first letters of the next word: fine, we erase and retype
+        // them too (in the new layout if we switch). Anything else — another word finished, a click,
+        // an arrow key, a different window — means we no longer know what is on screen: skip the fix.
+        var newLayout = fixing && fix.SwitchLayout ? r.Other : r.Layout;
+        IReadOnlyList<TypedKey> pending = Array.Empty<TypedKey>();
+        IntPtr pendingLayout = IntPtr.Zero;
+        bool known = Volatile.Read(ref _epoch) == r.Epoch && _word.TryPending(r.Hwnd, out pending, out pendingLayout);
+        if (Debug) Log.Write($"fix '{r.Typed}' → {fix.Kind} '{fix.NewText}' known={known} epoch={r.Epoch}/{_epoch}");
+        if (!known)
+        {
+            DeliverHeld(); // best effort: at least deliver the held Enter/Tab
+            return;
+        }
+        if (pendingLayout == IntPtr.Zero) pendingLayout = r.Layout;
+        string pendingOld = WordTracker.Render(pending, pendingLayout);
+        string pendingNew = fixing && fix.SwitchLayout ? WordTracker.Render(pending, r.Other) : pendingOld;
 
-                    if (!fixing)
-                    {
-                        Remember(typed, layout, alt, other, boundaryVk, hwnd, wasAuto: false);
-                        return;
-                    }
-                    SetContext(hwnd, Native.LangId(newLayout));
-                    Remember(fix.NewText, newLayout, typed, layout, boundaryVk, hwnd, wasAuto: true);
-                    ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {fix.NewText}  [{fix.Reason}]")));
-                }
+        int backspaces; string text;
+        if (fixing)
+        {
+            backspaces = r.Typed.Length + (hold ? 0 : 1) + pendingOld.Length;
+            text = fix.NewText + r.Boundary + pendingNew;
+        }
+        else if (hold) { backspaces = pendingOld.Length; text = r.Boundary + pendingOld; } // held Enter/Tab goes before the new letters
+        else { backspaces = 0; text = ""; }
+
+        if (fixing && fix.SwitchLayout) { SwitchLayoutVerified(r.Hwnd, r.Other); _word.SetLayout(r.Other); }
+        if (backspaces > 0 || text.Length > 0)
+        {
+            var swi = System.Diagnostics.Stopwatch.StartNew();
+            Injector.Replace(backspaces, text);
+            if (Debug) Log.Write($"  Replace({backspaces}, '{text}') took {swi.ElapsedMilliseconds} ms on thread {Environment.CurrentManagedThreadId}");
+        }
+
+        if (!fixing)
+        {
+            Remember(r.Typed, r.Layout, r.Alt, r.Other, r.BoundaryVk, r.Hwnd, wasAuto: false);
+            return;
+        }
+        SetContext(r.Hwnd, Native.LangId(newLayout));
+        // an undo must block the pair the corrector actually chose: for a fix in the other layout, that layout's form
+        string? rejectFrom = fix.SwitchLayout ? Corrector.StripPunctuation(r.Alt, out _, out _) : null;
+        Remember(fix.NewText, newLayout, r.Typed, r.Layout, r.BoundaryVk, r.Hwnd, wasAuto: true, rejectFrom);
+        ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{r.Typed} → {fix.NewText}  [{fix.Reason}]")));
     }
 
-    private void Remember(string text, IntPtr layout, string alt, IntPtr altLayout, int trailingVk, IntPtr hwnd, bool wasAuto)
+    private void Remember(string text, IntPtr layout, string alt, IntPtr altLayout, int trailingVk, IntPtr hwnd, bool wasAuto,
+        string? rejectFrom = null)
     {
         // After Enter the word may be gone (chat message sent), after Tab the caret is in another field — nothing to undo.
-        var lw = trailingVk is Native.VK_RETURN or Native.VK_TAB
-            ? null
-            : new LastWord(text, layout, alt, altLayout, trailingVk, hwnd, DateTime.UtcNow, wasAuto,
-                Corrector.StripPunctuation(wasAuto ? alt : text, out _, out _));
+        LastWord? lw = null;
+        if (trailingVk is not (Native.VK_RETURN or Native.VK_TAB))
+        {
+            var typedCore = Corrector.StripPunctuation(wasAuto ? alt : text, out _, out _);
+            lw = new LastWord(text, layout, alt, altLayout, trailingVk, hwnd, DateTime.UtcNow, wasAuto, typedCore, rejectFrom ?? typedCore);
+        }
         lock (_lock) _last = lw;
     }
 
@@ -462,15 +582,18 @@ public sealed class Engine : IDisposable
         {
             // the user disagreed with us: never offer this particular replacement again; after several rejections
             // of the same word, the word itself becomes a personal word (file I/O off the hook thread)
-            var from = last.OriginalCore;
+            var from = last.RejectFrom;
+            var word = last.TypedCore;
             var to = Corrector.StripPunctuation(last.Text, out _, out _);
+            var scope = ProcessName(hwnd);
             ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
             {
-                int n = _exceptions.Reject(from, to);
+                RuleScope.Current = scope; // pool threads keep whatever scope their last job left behind
+                int n = _exceptions.Reject(from, to, word);
                 Report($"[undo] {last.Text} → {last.AltText}; замена '{from}' → '{to}' больше не предлагается");
                 bool ask;
-                lock (_lock) ask = n >= Rules.UndosToSuggest && !_exceptions.Contains(from) && _suggested.Add(from);
-                if (ask) SuggestWord?.Invoke(from); // the tray asks the user; nothing is learned silently
+                lock (_lock) ask = n >= Rules.UndosToSuggest && !_exceptions.Contains(word) && _suggested.Add(word);
+                if (ask) SuggestWord?.Invoke(word); // the tray asks the user; nothing is learned silently
             }));
         }
         else
@@ -486,30 +609,43 @@ public sealed class Engine : IDisposable
     private static readonly bool IgnoreExclusions = Environment.GetEnvironmentVariable("SWITCHER_NO_EXCLUDE") == "1";
 
     /// <summary>Process name (without .exe) of a window, cached per pid.</summary>
-    public string ProcessName(IntPtr hwnd)
+    public string ProcessName(IntPtr hwnd) => Processes.Of(hwnd).Name;
+
+    /// <summary>
+    /// May we erase and retype text in this window? Not in an excluded program, not in a window class that is a
+    /// game or a list rather than a text field (letters there are hotkeys: in a viewport Backspace deletes geometry,
+    /// in Explorer it goes back), and not in a program running above our integrity level (UIPI drops our input).
+    /// </summary>
+    private bool CanRewrite(IntPtr hwnd)
     {
-        Native.GetWindowThreadProcessId(hwnd, out uint pid);
-        if (pid == 0) return "";
-        lock (_processNames)
+        var proc = Processes.Of(hwnd);
+        if (proc.Elevated) { LogSkipOnce("elevated", proc.Name); return false; }
+        if (IgnoreExclusions) return true;
+        foreach (var ex in _settings.ExcludedProcesses)
+            if (string.Equals(ex, proc.Name, StringComparison.OrdinalIgnoreCase)) return false;
+        var classes = _settings.ExcludedWindowClasses;
+        if (classes.Count > 0)
         {
-            if (!_processNames.TryGetValue(pid, out var name))
-            {
-                try { name = Process.GetProcessById((int)pid).ProcessName; }
-                catch { name = ""; }
-                if (_processNames.Count > 256) _processNames.Clear();
-                _processNames[pid] = name;
-            }
-            return name;
+            string top = Processes.ClassName(hwnd);
+            var focus = Injector.FocusWindow(hwnd);
+            string inner = focus == hwnd ? top : Processes.ClassName(focus);
+            foreach (var c in classes)
+                if (string.Equals(c, top, StringComparison.OrdinalIgnoreCase) || string.Equals(c, inner, StringComparison.OrdinalIgnoreCase))
+                {
+                    LogSkipOnce("window class " + c, proc.Name);
+                    return false;
+                }
         }
+        return true;
     }
 
-    private bool IsExcluded(IntPtr hwnd)
+    private readonly HashSet<string> _skipsLogged = new();
+    /// <summary>Explain once per program why nothing happens there — the log is where the user looks.</summary>
+    private void LogSkipOnce(string why, string process)
     {
-        if (IgnoreExclusions || _settings.ExcludedProcesses.Count == 0) return false;
-        var name = ProcessName(hwnd);
-        foreach (var ex in _settings.ExcludedProcesses)
-            if (string.Equals(ex, name, StringComparison.OrdinalIgnoreCase)) return true;
-        return false;
+        lock (_skipsLogged)
+            if (_skipsLogged.Count >= 200 || !_skipsLogged.Add(why + "|" + process)) return;
+        Log.Write($"not rewriting in '{process}': {why}");
     }
 
     private void Report(string message)
@@ -546,8 +682,18 @@ public sealed class Hotkey
 
     public static Hotkey Parse(string text)
     {
-        var h = new Hotkey { Vk = Native.VK_PAUSE };
-        if (string.IsNullOrWhiteSpace(text)) return h;
+        if (TryParse(text, out var h, out var problem)) return h;
+        if (!string.IsNullOrWhiteSpace(text)) Log.Write($"Hotkey '{text}': {problem}, using Pause");
+        return new Hotkey { Vk = Native.VK_PAUSE };
+    }
+
+    /// <summary>A hotkey that parses and is safe to swallow everywhere (see <see cref="IsAllowed"/>).</summary>
+    public static bool IsValid(string text) => TryParse(text, out _, out _);
+
+    private static bool TryParse(string text, out Hotkey hotkey, out string problem)
+    {
+        hotkey = null!; problem = "empty";
+        if (string.IsNullOrWhiteSpace(text)) return false;
         bool ctrl = false, shift = false, alt = false, win = false;
         uint vk = 0;
         foreach (var raw in text.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -559,13 +705,28 @@ public sealed class Hotkey
                 case "alt": alt = true; break;
                 case "win": win = true; break;
                 default:
-                    if (Enum.TryParse<Keys>(raw, ignoreCase: true, out var k)) vk = (uint)k;
-                    else Log.Write($"Unknown hotkey part '{raw}', using Pause");
+                    if (!Enum.TryParse<Keys>(raw, ignoreCase: true, out var k)) { problem = $"unknown key '{raw}'"; return false; }
+                    vk = (uint)k;
                     break;
             }
         }
-        if (vk == 0) return h;
-        return new Hotkey { Vk = vk, Ctrl = ctrl, Shift = shift, Alt = alt, Win = win };
+        if (vk == 0) { problem = "no key"; return false; }
+        if (!IsAllowed((Keys)vk, ctrl, alt, win)) { problem = "it would swallow a typing key"; return false; }
+        hotkey = new Hotkey { Vk = vk, Ctrl = ctrl, Shift = shift, Alt = alt, Win = win };
+        return true;
+    }
+
+    /// <summary>
+    /// The hotkey is swallowed everywhere, so on its own (or with just Shift) it must not be a key used for typing
+    /// or editing: letters, digits, Space, Enter, Backspace, arrows… With Ctrl, Alt or Win anything but a bare
+    /// modifier will do.
+    /// </summary>
+    public static bool IsAllowed(Keys key, bool ctrl, bool alt, bool win)
+    {
+        if (key is Keys.None or Keys.ShiftKey or Keys.ControlKey or Keys.Menu or Keys.LWin or Keys.RWin
+            or Keys.LShiftKey or Keys.RShiftKey or Keys.LControlKey or Keys.RControlKey or Keys.LMenu or Keys.RMenu) return false;
+        if (ctrl || alt || win) return true;
+        return key is Keys.Pause or Keys.Scroll or Keys.Apps or Keys.Insert || (key >= Keys.F1 && key <= Keys.F24);
     }
 
     public bool Matches(uint vk)

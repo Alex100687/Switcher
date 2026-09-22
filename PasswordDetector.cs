@@ -63,9 +63,26 @@ public sealed class PasswordDetector
             _answered.Reset();
             _pendingCaret = caret;
             _pendingHasCaret = hasCaret;
+            _pendingGen = _gen;
         }
         _request.Set();
     }
+
+    /// <summary>
+    /// The caret may have moved to another field (Tab, Enter, a click, a shortcut). In a browser every field of the page
+    /// shares one focus window, so the cached answer would still "match" — drop it, together with any answer that is
+    /// on its way for the old caret position.
+    /// </summary>
+    public void Forget()
+    {
+        lock (_lock)
+        {
+            _gen++;
+            _cachedFocus = IntPtr.Zero;
+            _cachedAt = DateTime.MinValue;
+        }
+    }
+    private int _gen, _pendingGen;
 
     /// <summary>
     /// Should we refrain from rewriting text here? True for a password box, and also while the very first UIA answer
@@ -113,8 +130,8 @@ public sealed class PasswordDetector
         while (true)
         {
             _request.WaitOne();
-            IntPtr focus; Native.POINT caret; bool hasCaret;
-            lock (_lock) { focus = _pending; caret = _pendingCaret; hasCaret = _pendingHasCaret; }
+            IntPtr focus; Native.POINT caret; bool hasCaret; int gen;
+            lock (_lock) { focus = _pending; caret = _pendingCaret; hasCaret = _pendingHasCaret; gen = _pendingGen; }
             bool result = false;
             try
             {
@@ -136,9 +153,12 @@ public sealed class PasswordDetector
             if (Environment.GetEnvironmentVariable("SWITCHER_DEBUG") == "1") Log.Write($"UIA answer for {focus:X}: password={result}");
             lock (_lock)
             {
-                _cachedFocus = focus;
-                _cachedValue = result;
-                _cachedAt = DateTime.UtcNow;
+                if (gen == _gen) // otherwise the caret moved while we asked: this answer is about another field
+                {
+                    _cachedFocus = focus;
+                    _cachedValue = result;
+                    _cachedAt = DateTime.UtcNow;
+                }
                 _busy = false;
                 _answered.Set();
             }

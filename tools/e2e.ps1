@@ -92,6 +92,9 @@ function Burst($name, $lang, $first, $rest, $accept) {
 # after our layout switch the same physical keys F,R,L,T,K,F now produce Cyrillic — SendKeys must be given the Cyrillic
 Burst "fix+switch, next word" $en "cltfknm r" "ак дела " @("сделать как дела ")
 Burst "fix, next word"        $ru "првиет к" "ак дела " @("привет как дела ")
+# Enter is held while "првиет" is being fixed; the next word and its space follow at once. The Enter must stay
+# between the words (v0.3.0 delivered it at the very end: "првиеткак \r\n").
+Burst "held enter, next word" $ru "првиет{ENTER}к" "ак " @("привет`r`nкак ", "првиет`r`nкак ")
 function Human($name, $lang, $keys, $expected, $delayMs = 40) {
     # physical keys by scan code (tools	yper.py), <keys> in US-layout letters, a real pause between keys
     if ($Only -and $name -notlike "*$Only*") { return }
@@ -143,6 +146,8 @@ Step "enter boundary"   $en "ntrcn{ENTER}"   "текст`r`n"
 
 Step "hotkey mid-word"   $en "ghbdtn{F9}"     "привет"
 Step "hotkey last word"  $en "hello {F9}"     "руддщ "
+# a second space: the word is no longer right before the caret, undo must not count back from here (v0.3.0: "пghbdtn ")
+Step "undo after 2 spaces" $en "ghbdtn  {F9}"  "привет  "
 Step "auto + undo"       $en "ghbdtn {F9}"    "ghbdtn "
 Step "learned exception" $en "ghbdtn "        "ghbdtn "
 "blocked.txt: " + ((Get-Content (Join-Path $data "blocked.txt") -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -notlike "#*" }) -join ", ")

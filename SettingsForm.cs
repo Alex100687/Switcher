@@ -41,8 +41,22 @@ public sealed class SettingsForm : Form
         FormClosed += (_, _) => _rules.Changed -= OnRulesChanged;
     }
 
+    /// <summary>Re-read every control from the settings (changed from the tray menu or by editing settings.json).</summary>
+    private readonly List<Action> _sync = new();
+    private bool _syncing;
+
+    public void SyncFromSettings()
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired) { BeginInvoke(SyncFromSettings); return; }
+        _syncing = true;
+        try { foreach (var a in _sync) a(); }
+        finally { _syncing = false; }
+    }
+
     private void Save()
     {
+        if (_syncing) return; // controls are being updated from the settings, not by the user
         _settings.Save();
         _saved();
     }
@@ -69,16 +83,28 @@ public sealed class SettingsForm : Form
         var hk = new TextBox { Text = _settings.Hotkey, ReadOnly = true, Width = 180, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 3, 3) };
         var tip = new ToolTip();
         tip.SetToolTip(hk, "Кликните и нажмите нужное сочетание. Esc — вернуть Pause.");
+        var hkWarn = new Label { AutoSize = true, ForeColor = Color.Firebrick, Visible = false, Anchor = AnchorStyles.Left, Margin = new Padding(3, 0, 3, 3) };
         hk.KeyDown += (_, e) =>
         {
             e.SuppressKeyPress = true; e.Handled = true;
             var key = e.KeyCode;
             if (key is Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.LWin or Keys.RWin) return;
+            // the hotkey is swallowed in every program: a typing key on its own would stop working everywhere
+            if (key != Keys.Escape && !Hotkey.IsAllowed(key, e.Control, e.Alt, win: false))
+            {
+                hkWarn.Text = $"«{key}» нужна для набора текста. Выберите Pause, F-клавишу или сочетание с Ctrl/Alt.";
+                hkWarn.Visible = true;
+                return;
+            }
+            hkWarn.Visible = false;
             string combo = key == Keys.Escape ? "Pause"
                 : string.Join("+", new[] { e.Control ? "Ctrl" : null, e.Alt ? "Alt" : null, e.Shift ? "Shift" : null, key.ToString() }.Where(x => x != null));
             hk.Text = combo; _settings.Hotkey = combo; _engine.ReloadHotkey(); Save();
         };
         grid.Controls.Add(hk);
+        grid.Controls.Add(hkWarn);
+        grid.SetColumnSpan(hkWarn, 2);
+        _sync.Add(() => { hk.Text = _settings.Hotkey; hkWarn.Visible = false; });
 
         Number(grid, "Минимум букв для переключения раскладки:", 1, 6, () => _settings.MinWordLength, v => _settings.MinWordLength = v);
         Number(grid, "Минимум букв для исправления опечаток:", 2, 8, () => _settings.MinSpellFixLength, v => _settings.MinSpellFixLength = v);
@@ -111,17 +137,19 @@ public sealed class SettingsForm : Form
     private void Check(TableLayoutPanel grid, string text, Func<bool> get, Action<bool> set)
     {
         var cb = new CheckBox { Text = text, AutoSize = true, Checked = get(), Anchor = AnchorStyles.Left };
-        cb.CheckedChanged += (_, _) => { set(cb.Checked); Save(); };
+        cb.CheckedChanged += (_, _) => { if (_syncing) return; set(cb.Checked); Save(); };
         grid.Controls.Add(cb);
         grid.SetColumnSpan(cb, 2);
+        _sync.Add(() => cb.Checked = get());
     }
 
     private void Number(TableLayoutPanel grid, string text, int min, int max, Func<int> get, Action<int> set)
     {
         grid.Controls.Add(new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 3, 3) });
         var n = new NumericUpDown { Minimum = min, Maximum = max, Value = Math.Clamp(get(), min, max), Width = 60, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 3, 3) };
-        n.ValueChanged += (_, _) => { set((int)n.Value); Save(); };
+        n.ValueChanged += (_, _) => { if (_syncing) return; set((int)n.Value); Save(); };
         grid.Controls.Add(n);
+        _sync.Add(() => n.Value = Math.Clamp(get(), min, max));
     }
 
     // ------------------------------------------------------------------ tab 2: excluded apps
@@ -129,9 +157,11 @@ public sealed class SettingsForm : Form
     private TabPage BuildAppsTab()
     {
         var page = new TabPage("Приложения") { Padding = new Padding(12) };
-        var label = new Label { Dock = DockStyle.Top, Height = 40, Text = "В этих программах Switcher ничего не делает (имя процесса без .exe). По умолчанию — IDE, терминалы, Unity, Blender, RDP." };
+        var label = new Label { Dock = DockStyle.Top, Height = 40, Text = "В этих программах Switcher ничего не делает (имя процесса без .exe). По умолчанию — IDE, терминалы, 3D/графика (3ds Max, Maya, Photoshop…), Unity, Blender, RDP." };
         var list = new ListBox { Dock = DockStyle.Fill, Sorted = true };
-        foreach (var p in _settings.ExcludedProcesses) list.Items.Add(p);
+        void Fill() { list.Items.Clear(); foreach (var p in _settings.ExcludedProcesses) list.Items.Add(p); }
+        Fill();
+        _sync.Add(Fill);
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, FlowDirection = FlowDirection.LeftToRight };
 
         var add = new Button { Text = "Добавить…", AutoSize = true };

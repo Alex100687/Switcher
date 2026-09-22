@@ -28,7 +28,7 @@ public sealed class Settings
 
     /// <summary>Bumped when a default changes; old files get the affected fields migrated in <see cref="Load"/>.</summary>
     public int SettingsVersion { get; set; } // 0 = file written before versioning
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
 
     /// <summary>Master switch.</summary>
     public bool Enabled { get; set; } = true;
@@ -70,6 +70,19 @@ public sealed class Settings
         "WindowsTerminal", "cmd", "powershell", "pwsh", "conhost", "mintty", "alacritty", "wezterm-gui",
         "Unity", "UnityHub", "blender",
         "mstsc", "vmware", "VirtualBoxVM",
+        "3dsmax", "maya", "houdini", "houdinifx", "Photoshop", "AfterFX", "ZBrush", "UnrealEditor", "Resolve",
+    };
+
+    /// <summary>Programs where letters are mostly hotkeys (Backspace in a 3ds Max viewport deletes geometry) — excluded since v3.</summary>
+    private static readonly string[] CreativeApps = { "3dsmax", "maya", "houdini", "houdinifx", "Photoshop", "AfterFX", "ZBrush", "UnrealEditor", "Resolve" };
+
+    /// <summary>
+    /// Window classes (of the foreground window or of the one with focus) that are not text fields: game engines,
+    /// where letters and Space are controls, and list/tree views, where typing selects items and Backspace navigates.
+    /// </summary>
+    public List<string> ExcludedWindowClasses { get; set; } = new()
+    {
+        "UnityWndClass", "UnrealWindow", "SDL_app", "GLFW30", "Valve001", "SysListView32", "SysTreeView32",
     };
 
     public static Settings Load()
@@ -81,7 +94,11 @@ public sealed class Settings
                 var s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath), JsonOptions);
                 if (s != null)
                 {
+                    s.Normalize();
                     if (s.SettingsVersion < 2 && s.MinSpellFixLength == 4) s.MinSpellFixLength = 3; // v2: broader spell fixing
+                    if (s.SettingsVersion < 3) // v3: CG and editing apps are excluded by default
+                        foreach (var app in CreativeApps)
+                            if (!s.ExcludedProcesses.Contains(app, StringComparer.OrdinalIgnoreCase)) s.ExcludedProcesses.Add(app);
                     if (s.SettingsVersion != CurrentVersion) { s.SettingsVersion = CurrentVersion; s.Save(); }
                     return s;
                 }
@@ -114,6 +131,47 @@ public sealed class Settings
             AtomicWrite(FilePath, JsonSerializer.Serialize(this, JsonOptions));
         }
         catch (Exception ex) { Log.Write("Settings save failed: " + ex.Message); }
+    }
+
+    /// <summary>A hand-edited file may say null where a list is expected.</summary>
+    private void Normalize()
+    {
+        ExcludedProcesses ??= new();
+        ExcludedWindowClasses ??= new();
+        if (!Switcher.Hotkey.IsValid(Hotkey)) // a letter or Backspace as the hotkey would stop working in every program
+        {
+            if (!string.IsNullOrWhiteSpace(Hotkey)) Log.Write($"Hotkey '{Hotkey}' is not usable, using Pause");
+            Hotkey = "Pause";
+        }
+    }
+
+    /// <summary>
+    /// Re-read the file after the user edited it by hand. Unlike <see cref="Load"/> it has no side effects: a file
+    /// that does not parse right now (still being edited) is simply ignored.
+    /// </summary>
+    public static bool TryRead(out Settings settings)
+    {
+        settings = null!;
+        try
+        {
+            var s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath), JsonOptions);
+            if (s == null) return false;
+            s.Normalize();
+            settings = s;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Write("Settings reload skipped: " + ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>Take over every value of <paramref name="other"/> — the engine and the UI keep this instance.</summary>
+    public void CopyFrom(Settings other)
+    {
+        foreach (var p in typeof(Settings).GetProperties())
+            if (p.CanRead && p.CanWrite) p.SetValue(this, p.GetValue(other));
     }
 
     /// <summary>Write via a temp file and replace, keeping the previous version as .bak — a crash mid-write never loses the file.</summary>

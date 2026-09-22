@@ -12,6 +12,8 @@ internal static class Program
             return SelfTest.Run(args.Skip(1).ToArray());
         if (args.Length > 1 && args[0] == "--ui-smoke")
             return SelfTest.UiSmoke(args[1]);
+        if (args.Length > 0 && args[0] == "--windows")
+            return SelfTest.Windows();
 
         // "--wait-for <pid>": started by Restart — let the previous instance release the mutex first
         int w = Array.IndexOf(args, "--wait-for");
@@ -31,7 +33,9 @@ internal static class Program
         Application.ThreadException += (_, e) => Log.Write("UI exception: " + e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Log.Write("Unhandled: " + e.ExceptionObject);
 
-        Application.Run(new TrayApp());
+        using var app = new TrayApp();
+        if (app.StartFailed) return 1;
+        Application.Run(app);
         return 0;
     }
 }
@@ -63,6 +67,35 @@ internal static class SelfTest
             bmp.Save($"{pngPrefix}-{tab}.png", System.Drawing.Imaging.ImageFormat.Png);
             f.Close();
         }
+        return 0;
+    }
+
+    /// <summary>
+    /// `Switcher.exe --windows` — every program with a window: process name, whether it runs above our integrity level
+    /// (Switcher leaves those alone) and the window class (for ExcludedWindowClasses). Prints to the parent console.
+    /// </summary>
+    public static int Windows()
+    {
+        Native.AttachConsole(-1);
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        Console.WriteLine();
+        var fg = Native.GetForegroundWindow();
+        var rows = new List<(string name, uint pid, bool elevated, string cls)>();
+        foreach (var p in System.Diagnostics.Process.GetProcesses())
+        {
+            using (p)
+            {
+                IntPtr h;
+                try { h = p.MainWindowHandle; } catch { continue; }
+                if (h == IntPtr.Zero) continue;
+                var info = Processes.Of(h);
+                rows.Add((info.Name, (uint)p.Id, info.Elevated, Processes.ClassName(h)));
+            }
+        }
+        foreach (var r in rows.OrderBy(r => r.name, StringComparer.OrdinalIgnoreCase))
+            Console.WriteLine($"{r.name,-28} {r.pid,7}  {(r.elevated ? "ELEVATED" : "        ")}  {r.cls}");
+        var f = Processes.Of(fg);
+        Console.WriteLine($"foreground: {f.Name} class={Processes.ClassName(fg)} focus={Processes.ClassName(Injector.FocusWindow(fg))}");
         return 0;
     }
 

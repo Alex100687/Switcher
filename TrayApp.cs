@@ -25,6 +25,13 @@ public sealed class TrayApp : ApplicationContext
     private SettingsForm? _settingsForm;
     private string? _offeredWord;
     private System.Windows.Forms.Timer? _pauseTimer;
+    private string? _loadError;
+    private FileSystemWatcher? _watcher;
+    private System.Threading.Timer? _reloadTimer;
+    private int _reloadSettings, _reloadRules;
+
+    /// <summary>The keyboard hook could not be installed; the host must not enter the message loop.</summary>
+    public bool StartFailed { get; }
 
     private void OpenSettings(int tab)
     {
@@ -98,8 +105,11 @@ public sealed class TrayApp : ApplicationContext
         }
         catch (Exception ex)
         {
+            // ExitThread() here would fire before Application.Run subscribes to it and leave a dead icon running
+            Log.Write("Keyboard hook failed: " + ex.Message);
             MessageBox.Show("Не удалось установить хук клавиатуры:\n" + ex.Message, "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            ExitThread();
+            _icon.Visible = false;
+            StartFailed = true;
             return;
         }
 
@@ -109,13 +119,66 @@ public sealed class TrayApp : ApplicationContext
             catch (Exception ex)
             {
                 Log.Write("Dictionary load failed: " + ex);
-                BeginInvokeUi(() => MessageBox.Show("Не удалось загрузить словари из папки dict:\n" + ex.Message, "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error));
+                _loadError = ex.Message;
+                BeginInvokeUi(() =>
+                {
+                    UpdateUi();
+                    MessageBox.Show("Не удалось загрузить словари из папки dict:\n" + ex.Message, "Switcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                });
                 return;
             }
             BeginInvokeUi(UpdateUi);
         });
 
+        WatchDataFiles();
         UpdateUi();
+    }
+
+    // ------------------------------------------------------------------ hand-edited files
+
+    /// <summary>
+    /// The tray menu opens settings.json and the rule files in an editor. Without re-reading them, the next change made
+    /// from the program (a checkbox, an undo) would write its in-memory copy over the user's edits.
+    /// </summary>
+    private void WatchDataFiles()
+    {
+        try
+        {
+            Directory.CreateDirectory(Settings.Dir);
+            _reloadTimer = new System.Threading.Timer(_ => BeginInvokeUi(ReloadDataFiles), null, Timeout.Infinite, Timeout.Infinite);
+            _watcher = new FileSystemWatcher(Settings.Dir)
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
+                IncludeSubdirectories = false,
+            };
+            _watcher.Changed += OnDataFileEvent;
+            _watcher.Created += OnDataFileEvent;
+            _watcher.Renamed += (s, e) => OnDataFileEvent(s, e);
+            _watcher.EnableRaisingEvents = true;
+        }
+        catch (Exception ex) { Log.Write("File watcher failed: " + ex.Message); }
+    }
+
+    private void OnDataFileEvent(object? sender, FileSystemEventArgs e)
+    {
+        var name = Path.GetFileName(e.FullPath);
+        if (name.Equals(Path.GetFileName(Settings.FilePath), StringComparison.OrdinalIgnoreCase)) Interlocked.Exchange(ref _reloadSettings, 1);
+        else if (name.Equals(Path.GetFileName(Rules.WordsPath), StringComparison.OrdinalIgnoreCase)
+                 || name.Equals(Path.GetFileName(Rules.BlockedPath), StringComparison.OrdinalIgnoreCase)
+                 || name.Equals(Path.GetFileName(Rules.AutocorrectPath), StringComparison.OrdinalIgnoreCase)) Interlocked.Exchange(ref _reloadRules, 1);
+        else return;
+        _reloadTimer?.Change(400, Timeout.Infinite); // editors save in several steps; our own writes land here too (harmless)
+    }
+
+    private void ReloadDataFiles()
+    {
+        if (Interlocked.Exchange(ref _reloadRules, 0) == 1) _exceptions.Reload();
+        if (Interlocked.Exchange(ref _reloadSettings, 0) == 1 && Settings.TryRead(out var fresh))
+        {
+            _settings.CopyFrom(fresh);
+            _engine?.ReloadHotkey();
+            UpdateUi();
+        }
     }
 
     private ContextMenuStrip BuildMenu()
@@ -176,21 +239,23 @@ public sealed class TrayApp : ApplicationContext
     private void UpdateUi()
     {
         bool on = _settings.Enabled;
-        _icon.Icon = on ? _iconOn : _iconOff;
         var hk = _settings.Hotkey;
         bool paused = _engine?.IsPaused == true;
-        _icon.Icon = on && !paused ? _iconOn : _iconOff;
-        _icon.Text = !_dicts.IsLoaded ? "Switcher — загрузка словарей…"
+        _icon.Icon = on && !paused && _loadError == null ? _iconOn : _iconOff;
+        string loading = _loadError != null ? "Switcher — словари не загрузились (см. лог)" : "Switcher — загрузка словарей…";
+        _icon.Text = !_dicts.IsLoaded ? loading
                    : paused ? $"Switcher — пауза до {_engine!.PausedUntil.ToLocalTime():HH:mm}"
                    : on ? $"Switcher — работает ({hk}: переключить/отменить)" : "Switcher — выключен";
         if (_miPause != null) _miPause.Text = paused ? $"Пауза (до {_engine!.PausedUntil.ToLocalTime():HH:mm})" : "Пауза";
-        _miStatus.Text = _dicts.IsLoaded ? $"Switcher v{Version}" : "Switcher — загрузка словарей…";
+        _miStatus.Text = _dicts.IsLoaded ? $"Switcher v{Version}" : loading;
         _miEnabled.Checked = on;
         _miSwitch.Checked = _settings.AutoSwitchLayout;
         _miSpell.Checked = _settings.AutoFixSpelling;
         _miBeep.Checked = _settings.Beep;
         _miLog.Checked = _settings.LogActions;
         _miAutostart.Checked = IsAutostart();
+        // the tray menu and a hand edit change the same settings: keep an open settings window in step
+        if (_settingsForm is { IsDisposed: false }) _settingsForm.SyncFromSettings();
     }
 
     private static string Version => typeof(TrayApp).Assembly.GetName().Version?.ToString(3) ?? "1.0";
@@ -287,6 +352,8 @@ public sealed class TrayApp : ApplicationContext
     {
         if (disposing)
         {
+            _watcher?.Dispose();
+            _reloadTimer?.Dispose();
             _engine?.Dispose();
             _icon.Visible = false;
             _icon.Dispose();

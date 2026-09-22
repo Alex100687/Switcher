@@ -159,7 +159,8 @@ public static class Injector
     };
 
     /// <summary>
-    /// Press the system layout-toggle hotkey (Alt+Shift / Ctrl+Shift per HKCU\Keyboard Layout\Toggle, else Win+Space).
+    /// Press the system layout-toggle hotkey per HKCU\Keyboard Layout\Toggle: 1 = Alt+Shift, 2 = Ctrl+Shift,
+    /// 3 = not assigned (Win+Space always works), 4 = the grave accent key (Ё).
     /// Used only when an app ignored WM_INPUTLANGCHANGEREQUEST and exactly two layouts are installed.
     /// </summary>
     public static void SendToggleHotkey()
@@ -176,6 +177,7 @@ public static class Injector
         {
             case "2": Down(list, Native.VK_CONTROL); Down(list, Native.VK_SHIFT); Up(list, Native.VK_SHIFT); Up(list, Native.VK_CONTROL); break;
             case "3": Down(list, Native.VK_LWIN); Down(list, Native.VK_SPACE); Up(list, Native.VK_SPACE); Up(list, Native.VK_LWIN); break;
+            case "4": Down(list, Native.VK_OEM_3); Up(list, Native.VK_OEM_3); break;
             default:  Down(list, Native.VK_MENU); Down(list, Native.VK_SHIFT); Up(list, Native.VK_SHIFT); Up(list, Native.VK_MENU); break;
         }
         Send(list);

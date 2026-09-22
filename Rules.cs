@@ -56,32 +56,42 @@ public sealed class Rules
 
     public Rules() => Reload();
 
+    /// <summary>
+    /// (Re)read all rule files — at start and whenever the user edits one by hand. A file that cannot be read right
+    /// now (an editor is saving it) keeps its previous rules: an empty list in memory would be written over the file
+    /// by the next change.
+    /// </summary>
     public void Reload()
     {
         lock (_lock)
         {
+            var old = _rules.ToList();
             _rules.Clear();
-            LoadWords(Path.Combine(Dictionaries.DictDir, "whitelist.txt"), builtin: true);
-            LoadWords(WordsPath, builtin: false);
-            LoadPairs(BlockedPath, RuleKind.Blocked, builtin: false);
-            LoadPairs(Path.Combine(Dictionaries.DictDir, "autocorrect.txt"), RuleKind.Autocorrect, builtin: true);
-            LoadPairs(AutocorrectPath, RuleKind.Autocorrect, builtin: false);
+            LoadWords(Path.Combine(Dictionaries.DictDir, "whitelist.txt"), builtin: true, old);
+            LoadWords(WordsPath, builtin: false, old);
+            LoadPairs(BlockedPath, RuleKind.Blocked, builtin: false, old);
+            LoadPairs(Path.Combine(Dictionaries.DictDir, "autocorrect.txt"), RuleKind.Autocorrect, builtin: true, old);
+            LoadPairs(AutocorrectPath, RuleKind.Autocorrect, builtin: false, old);
         }
         Changed?.Invoke();
     }
 
-    private void LoadWords(string path, bool builtin)
+    private void LoadWords(string path, bool builtin, List<Rule> old)
     {
-        foreach (var line in ReadLines(path))
+        var lines = ReadLines(path);
+        if (lines == null) { _rules.AddRange(old.Where(r => r.Kind == RuleKind.Word && r.Builtin == builtin)); return; }
+        foreach (var line in lines)
         {
             var (text, scope) = RuleScope.Split(line);
             if (text.Length > 0) _rules.Add(new Rule(RuleKind.Word, text, "", scope, builtin));
         }
     }
 
-    private void LoadPairs(string path, RuleKind kind, bool builtin)
+    private void LoadPairs(string path, RuleKind kind, bool builtin, List<Rule> old)
     {
-        foreach (var line in ReadLines(path))
+        var lines = ReadLines(path);
+        if (lines == null) { _rules.AddRange(old.Where(r => r.Kind == kind && r.Builtin == builtin)); return; }
+        foreach (var line in lines)
         {
             var (text, scope) = RuleScope.Split(line);
             int eq = text.IndexOf('=');
@@ -91,16 +101,23 @@ public sealed class Rules
         }
     }
 
-    private static IEnumerable<string> ReadLines(string path)
+    /// <summary>Meaningful lines of a rule file; empty if there is no file, null if it exists but cannot be read.</summary>
+    private static List<string>? ReadLines(string path)
     {
         string[] lines;
-        try { if (!File.Exists(path)) yield break; lines = File.ReadAllLines(path); }
-        catch (Exception ex) { Log.Write($"Rules load failed ({path}): {ex.Message}"); yield break; }
+        try
+        {
+            if (!File.Exists(path)) return new List<string>();
+            lines = File.ReadAllLines(path);
+        }
+        catch (Exception ex) { Log.Write($"Rules load failed ({path}): {ex.Message}"); return null; }
+        var result = new List<string>(lines.Length);
         foreach (var l in lines)
         {
             var t = l.Trim();
-            if (t.Length > 0 && !t.StartsWith('#')) yield return t;
+            if (t.Length > 0 && !t.StartsWith('#')) result.Add(t);
         }
+        return result;
     }
 
     // ------------------------------------------------------------------ lookups (scope-aware)
@@ -113,14 +130,17 @@ public sealed class Rules
         return false;
     }
 
+    /// <summary>Case-insensitive, ё = е — the spell fixer compares normalized words, the files keep what was typed.</summary>
     public bool IsBlocked(string from, string to)
     {
+        from = Key(from); to = Key(to);
         lock (_lock)
             foreach (var r in _rules)
-                if (r.Kind == RuleKind.Blocked && r.From.Equals(from, StringComparison.OrdinalIgnoreCase)
-                    && r.To.Equals(to, StringComparison.OrdinalIgnoreCase) && RuleScope.Applies(r.Scope)) return true;
+                if (r.Kind == RuleKind.Blocked && Key(r.From) == from && Key(r.To) == to && RuleScope.Applies(r.Scope)) return true;
         return false;
     }
+
+    private static string Key(string s) => s.Trim().ToLowerInvariant().Replace('ё', 'е');
 
     /// <summary>Explicit replacement; an app-specific rule beats a global one.</summary>
     public bool TryAutocorrect(string word, out string replacement)
@@ -139,19 +159,21 @@ public sealed class Rules
     // ------------------------------------------------------------------ learning
 
     /// <summary>
-    /// The user undid "from → to": remember the rejected pair (globally). Returns how many times corrections of this
-    /// word have been undone — the caller offers to make it a personal word at <see cref="UndosToSuggest"/>.
+    /// The user undid "from → to": remember the rejected pair (globally). <paramref name="word"/> is what the user had
+    /// typed — it differs from <paramref name="from"/> when the fix was made in the other layout. Returns how many times
+    /// corrections of that word have been undone — the caller offers to make it a personal word at <see cref="UndosToSuggest"/>.
     /// </summary>
-    public int Reject(string from, string to)
+    public int Reject(string from, string to, string? word = null)
     {
         from = from.Trim().ToLowerInvariant(); to = to.Trim().ToLowerInvariant();
+        word = (word ?? from).Trim().ToLowerInvariant();
         if (from.Length == 0 || to.Length == 0) return 0;
         int count;
         lock (_lock)
         {
-            if (!_rules.Any(r => r.Kind == RuleKind.Blocked && r.From == from && r.To == to && r.Scope == RuleScope.Global))
+            if (!_rules.Any(r => r.Kind == RuleKind.Blocked && Key(r.From) == Key(from) && Key(r.To) == Key(to) && r.Scope == RuleScope.Global))
                 AddLocked(new Rule(RuleKind.Blocked, from, to, RuleScope.Global, false));
-            count = _undoCount[from] = _undoCount.TryGetValue(from, out var n) ? n + 1 : 1;
+            count = _undoCount[word] = _undoCount.TryGetValue(word, out var n) ? n + 1 : 1;
         }
         Changed?.Invoke();
         return count;

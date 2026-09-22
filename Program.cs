@@ -196,7 +196,9 @@ internal static class SelfTest
                 var d = corrector.Decide(typed, tl, alt, al, keys.Any(k => WordTracker.IsDigitKey(k.Vk)), 0, new WordContext(sentence, prev));
                 if (d.Kind == ActionKind.FixSpelling)
                 {
-                    d = corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout), typed, alt, tl, al, sentence);
+                    var hkl = typedHkl;
+                    d = corrector.RespaceWithFix(prev, typed, tl, x => speller.Fix(x, hkl))
+                        ?? corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout), typed, alt, tl, al, sentence);
                     if (d.Kind != ActionKind.FixSpelling) d = Decision.Keep;
                 }
                 string text;

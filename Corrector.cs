@@ -482,7 +482,9 @@ public sealed class Corrector
         {
             if (IsCommonWord(first, lang) && IsCommonWord(core2, lang)) continue; // nothing wrong with this pair
             string joined = first + core2;
-            if (joined.Length >= 3 && IsCommonWord(joined, lang))
+            // a space inside one word: the whole must be common — or, when the tail alone is no word at all, any
+            // dictionary word ("интерес ность" → "интересность", not "интерес гость")
+            if (joined.Length >= 3 && (IsCommonWord(joined, lang) || (joined.Length >= 6 && !IsKnown(lang, core2) && _dicts.Check(lang, joined))))
             {
                 double s = Rarity(joined, lang) + 0.3;
                 if (s < best) { best = s; bestA = joined; bestB = null; }
@@ -505,6 +507,63 @@ public sealed class Corrector
         string oldText = prev.Text + " " + typed;
         if (newText == oldText || _exceptions.IsBlocked(oldText, newText)) return null;
         return new Decision(ActionKind.Replace, newText, bestB == null ? "space inside a word" : "space in the wrong place")
+        {
+            ErasePrevious = prev.Text.Length + 1, PreviousText = prev.Text + " ", PreviousWords = 1,
+        };
+    }
+
+    /// <summary>
+    /// A letter moved across the space <i>and</i> a typo: "себ ячувствешь" → "себя чувствуешь", "себяч увствешь" (where
+    /// "себяч" was already fixed to "себя") → the same. <see cref="Respace"/> needs two real words; here the second
+    /// part may be repaired by the spelling fixer (<paramref name="fixWord"/>, slow — this runs on the fix worker).
+    /// Only when the word before, as typed, is not a word — the moved letter broke it — and with the letter back it is
+    /// a common one; the repair of the second part is at most one cheap-to-moderate edit.
+    /// </summary>
+    public Decision? RespaceWithFix(PrevWord? prev, string typed, int lang, Func<string, Decision> fixWord)
+    {
+        if (prev == null || prev.Lang != lang || !_settings.FixSpaces) return null;
+        var core2 = StripPunctuation(typed, out var pre2, out var suf2);
+        var screen1 = StripPunctuation(prev.Text, out var pre1, out var suf1);
+        if (pre2.Length > 0 || suf1.Length > 0 || !IsPureLetters(core2) || !IsPureLetters(screen1)) return null;
+
+        var sources = new List<string> { screen1 };
+        if (prev.WasAuto && prev.AltLang == prev.Lang)
+        {
+            var original = StripPunctuation(prev.AltText, out var po, out var so);
+            if (po.Length == 0 && so.Length == 0 && IsPureLetters(original) && !original.Equals(screen1, StringComparison.OrdinalIgnoreCase))
+                sources.Add(original);
+        }
+        string? bestA = null, bestB = null;
+        double best = double.MaxValue;
+        foreach (var first in sources)
+        {
+            if (IsCommonWord(first, lang)) continue; // the word before is fine as it is: no reason to move letters
+            string joined = first + core2;
+            for (int shift = -2; shift <= 2; shift++)
+            {
+                int at = first.Length + shift;
+                if (shift == 0 || at < 2 || joined.Length - at < 3) continue;
+                string a = joined[..at], b = joined[at..];
+                if (!IsCommonWord(a, lang)) continue;
+                string repaired;
+                double s = Rarity(a, lang) + 0.4 * Math.Abs(shift);
+                if (IsCommonWord(b, lang)) { repaired = b; s += Rarity(b, lang); }
+                else
+                {
+                    var f = fixWord(b);
+                    repaired = StripPunctuation(f.NewText, out _, out _);
+                    if (f.Kind != ActionKind.FixSpelling || f.SwitchLayout || f.Cost > 1.0 || repaired.Length == 0 || repaired.Contains(' ')) continue;
+                    s += Rarity(repaired, lang) + 2 * f.Cost;
+                }
+                if (s < best) { best = s; bestA = a; bestB = repaired; }
+            }
+        }
+        if (bestA == null || bestB == null) return null;
+        string firstWord = char.IsUpper(screen1[0]) ? char.ToUpperInvariant(bestA[0]) + bestA[1..] : bestA;
+        string newText = pre1 + Recase(firstWord, lang, prev.StartedSentence) + " " + Recase(bestB.ToLowerInvariant(), lang, false) + suf2;
+        string oldText = prev.Text + " " + typed;
+        if (newText == oldText || _exceptions.IsBlocked(oldText, newText)) return null;
+        return new Decision(ActionKind.FixSpelling, newText, "letter moved across the space, and a typo")
         {
             ErasePrevious = prev.Text.Length + 1, PreviousText = prev.Text + " ", PreviousWords = 1,
         };

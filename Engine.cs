@@ -576,8 +576,10 @@ public sealed class Engine : IDisposable
             {
                 RuleScope.Current = r.Scope;
                 fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
+                // a letter that went over to this word, plus a typo in it ("себ ячувствешь"): repairs both words
+                var respaced = _corrector.RespaceWithFix(ToPrev(r.Before, r.Hwnd), r.Typed, Native.LangId(r.Layout), w => _speller.Fix(w, r.Layout));
                 // names, abbreviations and the start of a sentence get their capitals here too
-                fix = _corrector.AfterFix(fix, r.Typed, r.Alt, Native.LangId(r.Layout), Native.LangId(r.Other), r.SentenceStart);
+                fix = respaced ?? _corrector.AfterFix(fix, r.Typed, r.Alt, Native.LangId(r.Layout), Native.LangId(r.Other), r.SentenceStart);
             }
             catch (Exception ex)
             {
@@ -630,7 +632,7 @@ public sealed class Engine : IDisposable
         int backspaces; string text;
         if (fixing)
         {
-            backspaces = r.Typed.Length + (hold ? 0 : 1) + pendingOld.Length;
+            backspaces = fix.ErasePrevious + r.Typed.Length + (hold ? 0 : 1) + pendingOld.Length;
             text = fix.NewText + r.Boundary + pendingNew;
         }
         else if (hold) { backspaces = pendingOld.Length; text = r.Boundary + pendingOld; } // held Enter/Tab goes before the new letters
@@ -654,9 +656,12 @@ public sealed class Engine : IDisposable
         if (r.BoundaryVk != Native.VK_TAB) SetSentence(r.Hwnd, Corrector.EndsSentence(fix.NewText));
         // an undo must block the pair the corrector actually chose: for a fix in the other layout, that layout's form
         string? rejectFrom = fix.SwitchLayout ? Corrector.StripPunctuation(r.Alt, out _, out _) : null;
-        Remember(fix.NewText, newLayout, r.Typed, r.Layout, r.BoundaryVk, r.Hwnd, wasAuto: true, rejectFrom,
-            prev: r.Before, startedSentence: r.SentenceStart, learn: fix.Learn);
-        ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{r.Typed} → {fix.NewText}  [{fix.Reason}]")));
+        // a fix that took over the word before too: one entry for both, Pause restores both
+        string oldText = fix.PreviousText + r.Typed;
+        bool started = fix.PreviousWords > 0 ? Skip(r.Before, fix.PreviousWords - 1)?.StartedSentence ?? false : r.SentenceStart;
+        Remember(fix.NewText, newLayout, oldText, r.Layout, r.BoundaryVk, r.Hwnd, wasAuto: true, rejectFrom,
+            prev: Skip(r.Before, fix.PreviousWords), startedSentence: started, learn: fix.Learn);
+        ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{oldText} → {fix.NewText}  [{fix.Reason}]")));
     }
 
     private void Remember(string text, IntPtr layout, string alt, IntPtr altLayout, int trailingVk, IntPtr hwnd, bool wasAuto,

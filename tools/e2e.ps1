@@ -39,6 +39,16 @@ $form.Controls.Add($pw)
 $form.Show(); $form.Activate(); $tb.Focus()
 [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 500
 
+# typer.py types physical keys by scan code (pythonw: a console window would steal the foreground)
+$pyw = Join-Path (Split-Path (Get-Command python).Source) "pythonw.exe"   # not the WindowsApps store stub
+function Typer($keys, $delayMs = 40) {
+    $p = Start-Process -FilePath $pyw -ArgumentList @("`"$PSScriptRoot\typer.py`"", "`"$keys`"", $delayMs) -PassThru
+    while (-not $p.HasExited) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 5 }
+    for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+}
+# every case expects Caps Lock off (letter case is checked exactly)
+if ([System.Windows.Forms.Control]::IsKeyLocked('CapsLock')) { Typer "{CAPS}" }
+
 $en = [System.Windows.Forms.InputLanguage]::InstalledInputLanguages | ? { $_.Culture.Name -eq 'en-US' }
 $ru = [System.Windows.Forms.InputLanguage]::InstalledInputLanguages | ? { $_.Culture.Name -eq 'ru-RU' }
 
@@ -53,14 +63,14 @@ function Ensure-Foreground($name) {
 function Step($name, $lang, $keys, $expected) {
     if ($Only -and $name -notlike "*$Only*") { return }
     if (-not (Ensure-Foreground $name)) { return }
-    $tb.Clear()
+    $tb.Clear(); [System.Windows.Forms.SendKeys]::SendWait("{ESC}")   # clearing sends no key: tell Switcher the context is gone
     [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang
     [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait($keys)
     for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     $got = $tb.Text
     $layoutNow = [System.Windows.Forms.InputLanguage]::CurrentInputLanguage.Culture.Name
-    $ok = if ($got -eq $expected) { "OK  " } else { $script:failures++; "FAIL" }
+    $ok = if ($got -ceq $expected) { "OK  " } else { $script:failures++; "FAIL" }
     "{0} {1,-22} typed='{2}' got='{3}' expected='{4}' layout={5}" -f $ok, $name, $keys, $got, $expected, $layoutNow
 }
 
@@ -82,12 +92,12 @@ Step "fix + switch"      $en ";spym "         "жизнь "
 function Burst($name, $lang, $first, $rest, $accept) {
     if ($Only -and $name -notlike "*$Only*") { return }
     if (-not (Ensure-Foreground $name)) { return }
-    $tb.Clear(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    $tb.Clear(); [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait($first); Start-Sleep -Milliseconds 350   # fix is being computed while the next word has started
     [System.Windows.Forms.SendKeys]::SendWait($rest)
     for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     $got = $tb.Text
-    if ($accept -contains $got) { "OK   {0,-22} got='{1}'" -f $name, $got } else { $script:failures++; "FAIL {0,-22} got='{1}' expected one of: {2}" -f $name, $got, ($accept -join " | ") }
+    if ($accept -ccontains $got) { "OK   {0,-22} got='{1}'" -f $name, $got } else { $script:failures++; "FAIL {0,-22} got='{1}' expected one of: {2}" -f $name, $got, ($accept -join " | ") }
 }
 # after our layout switch the same physical keys F,R,L,T,K,F now produce Cyrillic — SendKeys must be given the Cyrillic
 Burst "fix+switch, next word" $en "cltfknm r" "ак дела " @("сделать как дела ")
@@ -99,14 +109,14 @@ function Human($name, $lang, $keys, $expected, $delayMs = 40) {
     # physical keys by scan code (tools	yper.py), <keys> in US-layout letters, a real pause between keys
     if ($Only -and $name -notlike "*$Only*") { return }
     if (-not (Ensure-Foreground $name)) { return }
-    $tb.Focus(); $tb.Clear(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    $tb.Focus(); $tb.Clear(); [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $lang; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
     # pythonw: a console window would steal the foreground and swallow the keys
     $pyw = Join-Path (Split-Path (Get-Command python).Source) "pythonw.exe"   # not the WindowsApps store stub
     $p = Start-Process -FilePath $pyw -ArgumentList @("`"$PSScriptRoot\typer.py`"", "`"$keys`"", $delayMs) -PassThru
     while (-not $p.HasExited) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 5 }
     for ($i = 0; $i -lt 15; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
     $got = $tb.Text
-    if ($got -eq $expected) { "OK   {0,-22} got='{1}'" -f $name, $got } else { $script:failures++; "FAIL {0,-22} got='{1}' expected='{2}'" -f $name, $got, $expected }
+    if ($got -ceq $expected) { "OK   {0,-22} got='{1}'" -f $name, $got } else { $script:failures++; "FAIL {0,-22} got='{1}' expected='{2}'" -f $name, $got, $expected }
 }
 # a fast typist: 25 keys/s, no pauses between words (keys given as US-layout letters)
 Human "fast typist switch"    $en "cltkfnm rfr ltkf " "сделать как дела "
@@ -123,19 +133,19 @@ Step "caps lock layout"  $en "GHBDTN "         "ПРИВЕТ "
 Step "camelCase keep"    $en "myVar "          "myVar "
 # manual layout switch in the middle of a word: "ult", Alt+Shift, " лежат"
 if ((-not $Only -or "manual switch" -like "*$Only*") -and (Ensure-Foreground "manual switch")) {
-    $tb.Clear(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $en; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200
+    $tb.Clear(); [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $en; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait("ult"); Start-Sleep -Milliseconds 150
     [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $ru; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait(" лежат ")
     for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
-    if ($tb.Text -eq "где лежат ") { "OK   manual switch         got='$($tb.Text)'" } else { $script:failures++; "FAIL manual switch         got='$($tb.Text)' expected='где лежат '" }
+    if ($tb.Text -ceq "где лежат ") { "OK   manual switch         got='$($tb.Text)'" } else { $script:failures++; "FAIL manual switch         got='$($tb.Text)' expected='где лежат '" }
 }
 # password box: never rewritten
 if ((-not $Only -or "password" -like "*$Only*") -and (Ensure-Foreground "password keep")) {
-    $pw.Clear(); $pw.Focus(); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $en; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    $pw.Clear(); $pw.Focus(); [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $en; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait("ghbdtn ")
     for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
-    if ($pw.Text -eq "ghbdtn ") { "OK   password keep         got='$($pw.Text)'" } else { $script:failures++; "FAIL password keep         got='$($pw.Text)' expected='ghbdtn '" }
+    if ($pw.Text -ceq "ghbdtn ") { "OK   password keep         got='$($pw.Text)'" } else { $script:failures++; "FAIL password keep         got='$($pw.Text)' expected='ghbdtn '" }
     $tb.Focus(); [System.Windows.Forms.Application]::DoEvents()
 }
 Step "missed space"       $ru "инужно "        "и нужно "
@@ -144,14 +154,47 @@ Step "ru sentence"      $en "ghbdtn rfr ltkf "  "привет как дела "
 Step "backspace"        $en "ghbdtnn{BS} "   "привет "
 Step "enter boundary"   $en "ntrcn{ENTER}"   "текст`r`n"
 
+# 0.5.0: letter case, spaces, words before, editing
+Step "two caps"           $ru "ПОжалуйста "      "Пожалуйста "
+Step "proper noun"        $ru "москва "          "Москва "
+Step "abbreviation"       $ru "сша "             "США "
+Step "sentence start"     $ru "привет. как "     "привет. Как "
+Step "shifted space"      $ru "ка кдела "        "как дела "
+Step "space inside word"  $ru "при вет "         "привет "
+Step "comma after space"  $ru "привет ,как "     "привет, как "
+Step "no space after ,"   $ru "привет,как "      "привет, как "
+Step "short word before"  $en "z ljvf "          "я дома "
+Step "shifted digit key"  $en "ghbdtn! "         "привет! "
+# Backspace into the word just finished: it is judged whole again (v0.4.0 fixed the tail alone: "пр" + "ивет" → "прживет")
+Step "reopen word"        $ru "пр {BS}ивет "     "привет "
+Step "reopen and fix"     $ru "пр {BS}евет "     "привет "
+# caret moved into a word with arrows: the letters typed there are a tail, not a word (v0.4.0: "интересгость")
+Step "tail after arrows"  $ru "интерес{LEFT}{RIGHT}ность " "интересность "
+# Caps Lock on by mistake: "пРИВЕТ" → "Привет", and Caps Lock goes off. Typed with typer.py: SendKeys juggles
+# Caps Lock itself to make its characters come out as written.
+if ((-not $Only -or "caps lock slip" -like "*$Only*") -and (Ensure-Foreground "caps lock slip")) {
+    $tb.Focus(); $tb.Clear(); [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); [System.Windows.Forms.InputLanguage]::CurrentInputLanguage = $ru; [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+    if ([System.Windows.Forms.Control]::IsKeyLocked('CapsLock')) { Typer "{CAPS}" }
+    Typer "{CAPS}Ghbdtn "       # Shift+G with Caps Lock on gives "п", the rest come out capital: "пРИВЕТ "
+    for ($i = 0; $i -lt 10; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
+    $capsOn = [System.Windows.Forms.Control]::IsKeyLocked('CapsLock')
+    if ($capsOn) { Typer "{CAPS}" }
+    if ($tb.Text -ceq "Привет " -and -not $capsOn) { "OK   caps lock slip        got='$($tb.Text)'" } else { $script:failures++; "FAIL caps lock slip        got='$($tb.Text)' capsLockStillOn=$capsOn expected='Привет ' and Caps Lock off" }
+}
+
 Step "hotkey mid-word"   $en "ghbdtn{F9}"     "привет"
 Step "hotkey last word"  $en "hello {F9}"     "руддщ "
 # a second space: the word is no longer right before the caret, undo must not count back from here (v0.3.0: "пghbdtn ")
 Step "undo after 2 spaces" $en "ghbdtn  {F9}"  "привет  "
 Step "auto + undo"       $en "ghbdtn {F9}"    "ghbdtn "
 Step "learned exception" $en "ghbdtn "        "ghbdtn "
+# the hotkey in the middle of a word, then the word goes on in the new layout: one word, not "при" + a tail
+Burst "hotkey, word goes on"  $en "ghb{F9}" "вет " @("привет ")
+# a word we fixed, reopened with Backspace and typed back as it was: not fixed again (and remembered as rejected)
+Burst "edited back"           $ru "превет " "{BS}{BS}{BS}{BS}{BS}{BS}{BS}превет " @("превет ")
 "blocked.txt: " + ((Get-Content (Join-Path $data "blocked.txt") -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -notlike "#*" }) -join ", ")
 
+if ([System.Windows.Forms.Control]::IsKeyLocked('CapsLock')) { Typer "{CAPS}" }   # leave the keyboard as we found it
 $form.Close()
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300

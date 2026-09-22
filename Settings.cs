@@ -28,7 +28,7 @@ public sealed class Settings
 
     /// <summary>Bumped when a default changes; old files get the affected fields migrated in <see cref="Load"/>.</summary>
     public int SettingsVersion { get; set; } // 0 = file written before versioning
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4; // v4: FixCase, CapitalizeSentences, FixSpaces written into old files
 
     /// <summary>Master switch.</summary>
     public bool Enabled { get; set; } = true;
@@ -38,6 +38,15 @@ public sealed class Settings
 
     /// <summary>Automatically fix single-edit typos in words that exist in no dictionary.</summary>
     public bool AutoFixSpelling { get; set; } = true;
+
+    /// <summary>Letter case: "ПОжалуйста" → "Пожалуйста", "пРИВЕТ" (Caps Lock) → "Привет", "москва" → "Москва", "сша" → "США".</summary>
+    public bool FixCase { get; set; } = true;
+
+    /// <summary>A capital letter at the start of a sentence (after . ! ? in the same field).</summary>
+    public bool CapitalizeSentences { get; set; } = true;
+
+    /// <summary>Spaces: "ка кдела" → "как дела", "при вет" → "привет", "привет ,как" / "привет,как" → "привет, как".</summary>
+    public bool FixSpaces { get; set; } = true;
 
     /// <summary>Shortest word (letters only) that may be auto-switched.</summary>
     public int MinWordLength { get; set; } = 2;

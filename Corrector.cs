@@ -1,12 +1,43 @@
 namespace Switcher;
 
-public enum ActionKind { None, SwitchLayout, FixSpelling }
+/// <summary>
+/// None — leave the word; SwitchLayout — retype in the other layout (synchronously); FixSpelling — unknown word, the
+/// fix is computed asynchronously (NewText empty) or already known (the worker's result); Replace — retype in the same
+/// layout right away (letter case, spaces, punctuation).
+/// </summary>
+public enum ActionKind { None, SwitchLayout, FixSpelling, Replace }
 
 /// <param name="Score">Lower is better; used to compare candidate fixes.</param>
 /// <param name="SwitchLayout">The fix is in the other layout: switch it and type the fixed word.</param>
 public sealed record Decision(ActionKind Kind, string NewText, string Reason, double Score = 0, bool SwitchLayout = false)
 {
+    /// <summary>Characters before the current word that <see cref="NewText"/> replaces too: previous words and the spaces after them.</summary>
+    public int ErasePrevious { get; init; }
+    /// <summary>What those characters were (the undo types them back).</summary>
+    public string PreviousText { get; init; } = "";
+    /// <summary>How many previous words <see cref="NewText"/> took over.</summary>
+    public int PreviousWords { get; init; }
+    /// <summary>The word was typed with Caps Lock on by mistake ("пРИВЕТ"): turn Caps Lock off after retyping it.</summary>
+    public bool CapsOff { get; init; }
+    /// <summary>Undoing it teaches nothing: a capital at the start of a sentence is about the place, not the word.</summary>
+    public bool Learn { get; init; } = true;
+
     public static readonly Decision Keep = new(ActionKind.None, "", "");
+}
+
+/// <summary>The word before the current one, exactly as it is on screen and followed by exactly one space.</summary>
+/// <param name="Lang">Language of <paramref name="Text"/>.</param>
+/// <param name="AltText">For a word left as typed: the same keys in the other layout. For a word we changed: what was typed.</param>
+/// <param name="StartedSentence">The word began a sentence (it should keep its capital if we retype it).</param>
+public sealed record PrevWord(string Text, int Lang, string AltText, int AltLang, bool WasAuto, bool StartedSentence, PrevWord? Before);
+
+/// <summary>What surrounds the word being decided.</summary>
+/// <param name="SentenceStart">The previous word ended a sentence (". ", "! ", "? ").</param>
+/// <param name="Prev">The word right before it, if we know what is on screen there.</param>
+/// <param name="Fragment">The word began where we saw no word boundary (the caret was moved into text): it may be the tail of a longer word.</param>
+public sealed record WordContext(bool SentenceStart = false, PrevWord? Prev = null, bool Fragment = false)
+{
+    public static readonly WordContext None = new();
 }
 
 /// <summary>Pure decision logic: given a word as typed and its rendering in the other layout, decide what to do.</summary>
@@ -46,23 +77,53 @@ public sealed class Corrector
 
     /// <summary>
     /// Fast part (dictionary lookups only) — safe to call from the keyboard hook.
-    /// Returns SwitchLayout / Keep, or FixSpelling with empty NewText meaning "unknown word, run <see cref="SuggestFix"/> asynchronously".
+    /// Returns SwitchLayout / Replace / Keep, or FixSpelling with empty NewText meaning "unknown word, fix it asynchronously".
     /// </summary>
     /// <param name="contextLang">Language of the words typed just before in this window (0 = unknown).</param>
-    public Decision Decide(string typed, int typedLang, string alt, int altLang, bool hasDigits, int contextLang = 0)
+    public Decision Decide(string typed, int typedLang, string alt, int altLang, bool hasDigits, int contextLang = 0, WordContext? context = null)
     {
-        if (!_dicts.IsLoaded || hasDigits) return Decision.Keep;
+        var wc = context ?? WordContext.None;
+        if (!_dicts.IsLoaded) return Decision.Keep;
+        // digit keys with Shift are punctuation ("!" is Shift+1, the Russian "?" is Shift+7): only real digits count
+        hasDigits &= typed.Any(char.IsDigit) || alt.Any(char.IsDigit);
         if (!_dicts.Supports(typedLang) || !_dicts.Supports(altLang)) return Decision.Keep;
 
-        var core = StripPunctuation(typed, out _, out _);
-        var altCore = StripPunctuation(alt, out _, out _);
+        var single = DecideWord(typed, typedLang, alt, altLang, hasDigits, contextLang, wc.SentenceStart && !wc.Fragment);
+        // The tail of a longer word: letters typed in the wrong layout are wrong wherever they are, but spelling,
+        // capitals and spaces can only be judged on the whole word.
+        if (wc.Fragment) return single.Kind == ActionKind.SwitchLayout ? single with { NewText = alt, CapsOff = false } : Decision.Keep;
+        if (wc.Prev == null || hasDigits) return single;
+        return DecidePair(single, typed, typedLang, alt, altLang, wc) ?? single;
+    }
+
+    private Decision DecideWord(string typed, int typedLang, string alt, int altLang, bool hasDigits, int contextLang, bool sentenceStart)
+    {
+        if (hasDigits) return Decision.Keep;
+        var core = StripPunctuation(typed, out var pre, out var suf);
+        var altCore = StripPunctuation(alt, out var altPre, out var altSuf);
 
         if (core.Length == 0) return Decision.Keep;
         // explicit autocorrect rules win over everything, including dictionary words ("ихний" → "их")
         if (_settings.AutoFixSpelling && _exceptions.TryAutocorrect(core, out _))
             return new Decision(ActionKind.FixSpelling, "", "autocorrect");
         if (_exceptions.Contains(core)) return Decision.Keep; // known word (whitelist / user's exceptions)
-        if (IsCamelCase(core) || IsCamelCase(altCore)) return Decision.Keep; // myVar, GameObject — code, not prose
+
+        // "привет,как" → "привет, как" (and "ghbdtn?rfr", the same keys in the wrong layout)
+        if (_settings.FixSpaces && SpaceAfterPunctuation(typed, core, typedLang, alt, altCore, altLang, sentenceStart) is { } spaced)
+            return spaced;
+
+        // Shift held a moment too long ("ПОжалуйста") or Caps Lock on by mistake ("пРИВЕТ"): the word is "Пожалуйста"
+        bool capsTyped = false, capsAlt = false, slipTyped = false, slipAlt = false;
+        if (_settings.FixCase)
+        {
+            var unslipped = UnslipCase(core, typedLang, out capsTyped);
+            var altUnslipped = UnslipCase(altCore, altLang, out capsAlt);
+            slipTyped = unslipped != core; slipAlt = altUnslipped != altCore;
+            core = unslipped; altCore = altUnslipped;
+        }
+        // myVar, GameObject — code, not prose. (The other layout of a shift slip has the same odd capitals —
+        // "ПОжалуйста" is "GJ;fkeqcnf" — which says nothing once one side reads as a word.)
+        if ((IsCamelCase(core) && !slipAlt) || (IsCamelCase(altCore) && !slipTyped)) return Decision.Keep;
         bool allUpper = IsAllUpper(core); // abbreviation (API) — or Caps Lock in the wrong layout (GHBDTN)
 
         // English dictionary is full of 2-letter abbreviations ("nu", "dr"), so demand one letter more for EN.
@@ -71,6 +132,7 @@ public sealed class Corrector
         bool keepsLetters = alt.Length - altCore.Length <= typed.Length - core.Length;
         bool altIsWord = _settings.AutoSwitchLayout && altCore.Length >= minLen && IsWordShaped(altCore) && keepsLetters
                          && IsKnown(altLang, altCore) && !_exceptions.IsBlocked(core, altCore);
+        string altText = altPre + altCore + altSuf, typedText = pre + core + suf;
 
         bool coreIsWord = IsWordShaped(core);
         if (coreIsWord && IsKnown(typedLang, core))
@@ -78,13 +140,13 @@ public sealed class Corrector
             // A word in both languages ("tot" = "еще", "ult" = "где", "руку" = "here"): the surrounding text decides,
             // and with no context a hugely more common word in the other language wins.
             if (altIsWord && !_exceptions.Contains(core) && PreferOther(core, typedLang, altCore, altLang, contextLang, out var why))
-                return new Decision(ActionKind.SwitchLayout, alt, $"'{core}' ({LangName(typedLang)}) vs '{altCore}' ({LangName(altLang)}): {why}");
-            return Decision.Keep;
+                return Switch(altText, altLang, sentenceStart, capsAlt, $"'{core}' ({LangName(typedLang)}) vs '{altCore}' ({LangName(altLang)}): {why}");
+            return KeepOrRecase(typed, typedText, typedLang, sentenceStart, capsTyped);
         }
 
         // Typed in wrong layout?
         if (altIsWord)
-            return new Decision(ActionKind.SwitchLayout, alt, $"'{core}' not in {LangName(typedLang)}, '{altCore}' in {LangName(altLang)}");
+            return Switch(altText, altLang, sentenceStart, capsAlt, $"'{core}' not in {LangName(typedLang)}, '{altCore}' in {LangName(altLang)}");
 
         if (allUpper) return Decision.Keep; // don't "fix" abbreviations
 
@@ -95,8 +157,335 @@ public sealed class Corrector
         if (_settings.AutoFixSpelling && (typedFixable || altFixable))
             return new Decision(ActionKind.FixSpelling, "", "unknown word");
 
-        return Decision.Keep;
+        return KeepOrRecase(typed, typedText, typedLang, sentenceStart, capsTyped); // an unknown name at the start of a sentence still gets its capital
     }
+
+    private Decision Switch(string text, int lang, bool sentenceStart, bool capsOff, string reason) =>
+        new(ActionKind.SwitchLayout, Recase(text, lang, sentenceStart), reason) { CapsOff = capsOff };
+
+    /// <summary>The word stays — unless only its letter case needs fixing.</summary>
+    private Decision KeepOrRecase(string typed, string text, int lang, bool sentenceStart, bool capsOff)
+    {
+        var cased = Recase(text, lang, sentenceStart);
+        if (cased == typed) return Decision.Keep;
+        bool onlySentence = Recase(text, lang, false) == typed;
+        return new Decision(ActionKind.Replace, cased, onlySentence ? "start of sentence" : "letter case") { CapsOff = capsOff, Learn = !onlySentence };
+    }
+
+    /// <summary>
+    /// The worker's spelling fix gets the same letter case treatment as the synchronous decisions; an unknown word
+    /// the fixer left alone may still need a capital (a name at the start of a sentence).
+    /// </summary>
+    public Decision AfterFix(Decision fix, string typed, int typedLang, int otherLang, bool sentenceStart)
+    {
+        if (fix.Kind == ActionKind.FixSpelling && fix.NewText.Length > 0)
+            return fix with { NewText = Recase(fix.NewText, fix.SwitchLayout ? otherLang : typedLang, sentenceStart) };
+        var cased = Recase(typed, typedLang, sentenceStart);
+        if (cased == typed) return fix;
+        bool onlySentence = Recase(typed, typedLang, false) == typed;
+        return new Decision(ActionKind.FixSpelling, cased, onlySentence ? "start of sentence" : "letter case") { Learn = !onlySentence };
+    }
+
+    // ------------------------------------------------------------------ letter case
+
+    /// <summary>
+    /// The letter case the word should have: shift slips undone ("ПОжалуйста", "пРИВЕТ"), dictionary capitals for names,
+    /// places and abbreviations ("москва" → "Москва", "сша" → "США", "i" → "I"), and a capital at the start of a sentence.
+    /// Personal and whitelisted words are left exactly as typed; so are case changes the user has undone before.
+    /// </summary>
+    public string Recase(string text, int lang, bool sentenceStart)
+    {
+        var core = StripPunctuation(text, out var pre, out var suf);
+        if (core.Length == 0 || _exceptions.Contains(core)) return text;
+        bool capitalize = sentenceStart && _settings.CapitalizeSentences;
+        if (!IsWordShaped(core))
+        {
+            // "в общем" (an autocorrect result) at the start of a sentence: only its first letter
+            int sp = core.IndexOf(' ');
+            if (capitalize && sp > 0 && IsWordShaped(core[..sp]) && IsAllLower(core[..sp]))
+                return pre + char.ToUpperInvariant(core[0]) + core[1..] + suf;
+            return text;
+        }
+        string result = core;
+        if (_settings.FixCase)
+        {
+            result = UnslipCase(result, lang, out _);
+            if (IsAllLower(result))
+            {
+                var proper = _dicts.ProperCase(lang, result);
+                if (proper != null && !_exceptions.IsBlocked(result, proper)) result = proper;
+            }
+        }
+        if (capitalize && IsAllLower(result) && !_exceptions.IsBlocked(result, char.ToUpperInvariant(result[0]) + result[1..]))
+            result = char.ToUpperInvariant(result[0]) + result[1..];
+        return pre + result + suf;
+    }
+
+    /// <summary>"ПОжалуйста" (Shift held too long) / "пРИВЕТ" (Caps Lock on) → "Пожалуйста" / "Привет" — only if that is a word.</summary>
+    private string UnslipCase(string core, int lang, out bool capsLock)
+    {
+        capsLock = false;
+        bool two = IsTwoCaps(core), inverted = IsInvertedCaps(core);
+        if (!two && !inverted) return core;
+        var title = char.ToUpperInvariant(core[0]) + core[1..].ToLowerInvariant();
+        if (!IsKnown(lang, title) || _exceptions.IsBlocked(core, title)) return core;
+        capsLock = inverted;
+        return title;
+    }
+
+    /// <summary>Two capitals, then at least two lowercase letters and nothing else: "ПОжалуйста", "HEllo" (not "IDs", "ВКонтакте" if unknown).</summary>
+    public static bool IsTwoCaps(string s)
+    {
+        if (s.Length < 4 || !IsPureLetters(s) || !char.IsUpper(s[0]) || !char.IsUpper(s[1])) return false;
+        for (int i = 2; i < s.Length; i++) if (!char.IsLower(s[i])) return false;
+        return true;
+    }
+
+    /// <summary>First letter small, all the others capital: Caps Lock was on and Shift pressed for the capital ("пРИВЕТ").</summary>
+    public static bool IsInvertedCaps(string s)
+    {
+        if (s.Length < 3 || !IsPureLetters(s) || !char.IsLower(s[0])) return false;
+        for (int i = 1; i < s.Length; i++) if (!char.IsUpper(s[i])) return false;
+        return true;
+    }
+
+    private static bool IsAllLower(string s)
+    {
+        bool any = false;
+        foreach (var c in s)
+        {
+            if (!char.IsLetter(c)) continue;
+            if (!char.IsLower(c)) return false;
+            any = true;
+        }
+        return any;
+    }
+
+    private static readonly HashSet<string> Abbreviations = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "др", "пр", "см", "ср", "стр", "рис", "табл", "гл", "гг", "вв", "ул", "корп", "обл", "руб", "коп", "тыс", "млн",
+        "млрд", "им", "проф", "доц", "акад", "св", "тел", "напр", "англ", "рус", "лат", "мин", "сек", "мм", "км", "кг", "шт",
+        "etc", "vs", "mr", "mrs", "ms", "dr", "st", "jr", "sr", "inc", "ltd", "co", "no", "vol", "fig", "approx", "eg", "ie", "pp",
+    };
+
+    /// <summary>
+    /// Does the word end a sentence, so that the next one starts with a capital? "!" and "?" do; "." does unless the
+    /// word is an abbreviation ("т.е.", "др.", "г."), an initial, a number; an ellipsis does not (the thought goes on).
+    /// </summary>
+    public static bool EndsSentence(string text)
+    {
+        var t = text.TrimEnd('"', '»', '”', '’', '\'', ')', ']');
+        if (t.Length == 0 || t.EndsWith("...") || t.EndsWith('…')) return false;
+        char last = t[^1];
+        if (last is '!' or '?') return true;
+        if (last != '.') return false;
+        var core = StripPunctuation(t, out _, out _);
+        if (core.Length <= 1 || core.Contains('.') || core.Any(char.IsDigit) || Abbreviations.Contains(core)) return false;
+        return IsWordShaped(core);
+    }
+
+    // ------------------------------------------------------------------ spaces and punctuation
+
+    private const string SpacedPunctuation = ",;:!?";
+
+    /// <summary>"привет,как" → "привет, как"; the same keys in the wrong layout ("ghbdtn?rfr") → switched and spaced.</summary>
+    private Decision? SpaceAfterPunctuation(string typed, string core, int typedLang, string alt, string altCore, int altLang, bool sentenceStart)
+    {
+        StripPunctuation(typed, out var pre, out var suf);
+        var own = SpaceSegments(core, typedLang, sentenceStart);
+        if (own != null) return new Decision(ActionKind.Replace, pre + own + suf, "space after punctuation");
+        // a real word as typed is not a wrong-layout "a;b" ("может" is "vj;tn" in the other layout)
+        if (!_settings.AutoSwitchLayout || (IsWordShaped(core) && IsKnown(typedLang, core))) return null;
+        StripPunctuation(alt, out var altPre, out var altSuf);
+        var other = SpaceSegments(altCore, altLang, sentenceStart);
+        if (other != null && !_exceptions.IsBlocked(core, altCore))
+            return new Decision(ActionKind.SwitchLayout, altPre + other + altSuf, "wrong layout, space after punctuation");
+        return null;
+    }
+
+    /// <summary>"a,b" → "a, b" when every part is a known word of 2+ letters; null otherwise (URLs, code, numbers stay).</summary>
+    private string? SpaceSegments(string core, int lang, bool sentenceStart)
+    {
+        var parts = new List<string>();
+        var seps = new List<char>();
+        int start = 0;
+        for (int i = 0; i < core.Length; i++)
+        {
+            if (SpacedPunctuation.IndexOf(core[i]) < 0) continue;
+            parts.Add(core[start..i]);
+            seps.Add(core[i]);
+            start = i + 1;
+        }
+        if (seps.Count == 0) return null;
+        parts.Add(core[start..]);
+        foreach (var p in parts)
+            if (p.Length < 2 || !IsWordShaped(p) || !IsKnown(lang, p) || (p.Length == 2 && !IsCommonWord(p, lang))) return null;
+        var sb = new System.Text.StringBuilder(Recase(parts[0], lang, sentenceStart));
+        for (int i = 0; i < seps.Count; i++)
+            sb.Append(seps[i]).Append(' ').Append(Recase(parts[i + 1], lang, seps[i] is '!' or '?'));
+        return sb.ToString();
+    }
+
+    /// <summary>Decisions that also rewrite the word before: short words in the same wrong layout, punctuation, spaces.</summary>
+    private Decision? DecidePair(Decision single, string typed, int typedLang, string alt, int altLang, WordContext wc)
+    {
+        var prev = wc.Prev!;
+        // Short words right before a word typed in the wrong layout were typed in the same wrong layout: "z ljvf" → "я дома"
+        if (single.Kind == ActionKind.SwitchLayout && _settings.AutoSwitchLayout)
+        {
+            var fixedWords = new List<string>();
+            string oldText = "";
+            int erase = 0;
+            for (var p = prev; p != null && fixedWords.Count < 3 && ShortWordInWrongLayout(p, typedLang, altLang, out var fixedWord); p = p.Before)
+            {
+                fixedWords.Insert(0, fixedWord);
+                oldText = p.Text + " " + oldText;
+                erase += p.Text.Length + 1;
+            }
+            if (fixedWords.Count > 0)
+                return single with
+                {
+                    NewText = string.Join(" ", fixedWords) + " " + single.NewText,
+                    ErasePrevious = erase, PreviousText = oldText, PreviousWords = fixedWords.Count,
+                    Reason = single.Reason + $"; {fixedWords.Count} short word(s) before it too",
+                };
+        }
+        if (!_settings.FixSpaces) return null;
+        if (MovePunctuationBack(single, typed, typedLang, altLang, prev) is { } moved) return moved;
+        if (single.Kind != ActionKind.SwitchLayout && Respace(typed, typedLang, prev) is { } respaced) return respaced;
+        return null;
+    }
+
+    private static readonly Dictionary<int, string> SingleLetterWords = new()
+    {
+        [Dictionaries.LangRu] = "авиксоуя",
+        [Dictionaries.LangEn] = "ai",
+    };
+
+    private static bool IsSingleLetterWord(string w, int lang) =>
+        w.Length == 1 && SingleLetterWords.TryGetValue(lang, out var set) && set.Contains(char.ToLowerInvariant(w[0]));
+
+    /// <summary>A word we left alone that is gibberish here but a short word in the other layout ("z" → "я", "rfr" → "как").</summary>
+    private bool ShortWordInWrongLayout(PrevWord p, int typedLang, int altLang, out string fixedWord)
+    {
+        fixedWord = "";
+        if (p.WasAuto || p.Lang != typedLang || p.AltLang != altLang) return false;
+        var core = StripPunctuation(p.Text, out _, out _);
+        var altCore = StripPunctuation(p.AltText, out _, out _);
+        if (core.Length == 0 || core.Length > 3 || altCore.Length != core.Length || !IsWordShaped(altCore)) return false;
+        if (p.AltText.Length - altCore.Length > p.Text.Length - core.Length) return false; // letters must stay letters
+        if (core.Length == 1)
+        {
+            if (IsSingleLetterWord(core, typedLang) || !IsSingleLetterWord(altCore, altLang)) return false;
+        }
+        else if (IsKnown(typedLang, core) || !IsKnown(altLang, altCore)) return false;
+        if (_exceptions.IsBlocked(core, altCore)) return false;
+        fixedWord = Recase(p.AltText, altLang, p.StartedSentence);
+        return true;
+    }
+
+    /// <summary>
+    /// Punctuation typed after the space instead of before it: "привет ,как" → "привет, как", "привет ," → "привет,".
+    /// Not for emoticons (":)", ";D") and not for ".net"-like words.
+    /// </summary>
+    private Decision? MovePunctuationBack(Decision single, string typed, int typedLang, int altLang, PrevWord prev)
+    {
+        if (single.Kind == ActionKind.FixSpelling || single.ErasePrevious > 0) return null;
+        string text = single.Kind is ActionKind.SwitchLayout or ActionKind.Replace ? single.NewText : typed;
+        int lang = single.Kind == ActionKind.SwitchLayout ? altLang : typedLang;
+        int n = 0;
+        while (n < text.Length && (SpacedPunctuation.IndexOf(text[n]) >= 0 || text[n] == '.')) n++;
+        if (n == 0) return null;
+        string punct = text[..n], rest = text[n..];
+        if (rest.Length > 0)
+        {
+            var restCore = StripPunctuation(rest, out var restPre, out _);
+            if (punct.Contains('.') || restPre.Length > 0 || restCore.Length < 2 || !IsWordShaped(restCore)) return null;
+        }
+        if (prev.Text.Length == 0 || !char.IsLetterOrDigit(prev.Text[^1])) return null;
+        string head = prev.Text + punct;
+        string newText = rest.Length > 0 ? head + " " + Recase(rest, lang, EndsSentence(head)) : head;
+        if (_exceptions.IsBlocked(prev.Text + " " + typed, newText)) return null;
+        return new Decision(single.Kind == ActionKind.SwitchLayout ? ActionKind.SwitchLayout : ActionKind.Replace, newText, "punctuation belongs to the word before")
+        {
+            ErasePrevious = prev.Text.Length + 1, PreviousText = prev.Text + " ", PreviousWords = 1, CapsOff = single.CapsOff,
+        };
+    }
+
+    /// <summary>
+    /// A space typed one or two letters early or late ("ка кдела" → "как дела", "какд ела" → "как дела") or where there
+    /// should be none ("при вет" → "привет"). Only when the pair as typed is not two real words, and the new pair is.
+    /// For a previous word we had already corrected, what was typed is tried as well ("какд" fixed to "как", then "ела").
+    /// </summary>
+    private Decision? Respace(string typed, int lang, PrevWord prev)
+    {
+        if (prev.Lang != lang) return null;
+        var core2 = StripPunctuation(typed, out var pre2, out var suf2);
+        var screen1 = StripPunctuation(prev.Text, out var pre1, out var suf1);
+        if (pre2.Length > 0 || suf1.Length > 0 || !IsPureLetters(core2) || !IsPureLetters(screen1)) return null;
+
+        var sources = new List<string> { screen1 };
+        if (prev.WasAuto && prev.AltLang == prev.Lang)
+        {
+            var original = StripPunctuation(prev.AltText, out var po, out var so);
+            if (po.Length == 0 && so.Length == 0 && IsPureLetters(original) && !original.Equals(screen1, StringComparison.OrdinalIgnoreCase))
+                sources.Add(original);
+        }
+        bool screenPairKnown = IsCommonWord(screen1, lang) && IsCommonWord(core2, lang);
+        double screenScore = screenPairKnown ? Rarity(screen1, lang) + Rarity(core2, lang) : double.MaxValue;
+
+        string? bestA = null, bestB = null;
+        double best = double.MaxValue;
+        foreach (var first in sources)
+        {
+            if (IsCommonWord(first, lang) && IsCommonWord(core2, lang)) continue; // nothing wrong with this pair
+            string joined = first + core2;
+            if (joined.Length >= 3 && IsCommonWord(joined, lang))
+            {
+                double s = Rarity(joined, lang) + 0.3;
+                if (s < best) { best = s; bestA = joined; bestB = null; }
+            }
+            for (int shift = -2; shift <= 2; shift++)
+            {
+                int at = first.Length + shift;
+                if (shift == 0 || at < 1 || at > joined.Length - 1) continue;
+                string a = joined[..at], b = joined[at..];
+                if (!IsCommonWord(a, lang) || !IsCommonWord(b, lang)) continue;
+                double s = Rarity(a, lang) + Rarity(b, lang) + 0.4 * Math.Abs(shift);
+                if (s < best) { best = s; bestA = a; bestB = b; }
+            }
+        }
+        if (bestA == null) return null;
+        if (screenPairKnown && best > screenScore - 1.0) return null; // the screen already reads as two real words: need a clearly better reading
+        // keep the capital the first word had; names and places get theirs
+        string first2 = char.IsUpper(screen1[0]) ? char.ToUpperInvariant(bestA[0]) + bestA[1..] : bestA;
+        string newText = pre1 + Recase(first2, lang, prev.StartedSentence) + (bestB != null ? " " + Recase(bestB, lang, false) : "") + suf2;
+        string oldText = prev.Text + " " + typed;
+        if (newText == oldText || _exceptions.IsBlocked(oldText, newText)) return null;
+        return new Decision(ActionKind.Replace, newText, bestB == null ? "space inside a word" : "space in the wrong place")
+        {
+            ErasePrevious = prev.Text.Length + 1, PreviousText = prev.Text + " ", PreviousWords = 1,
+        };
+    }
+
+    /// <summary>A word good enough to split into: common (rare dictionary words make spurious splits), single letters only if they are words.</summary>
+    private bool IsCommonWord(string w, int lang)
+    {
+        if (w.Length == 1) return IsSingleLetterWord(w, lang);
+        if (_exceptions.Contains(w)) return true;
+        int rank = _freq.Rank(lang, w);
+        if (w.Length == 2) return rank <= (lang == Dictionaries.LangRu ? 5_000 : 1_000) && (_dicts.Check(lang, w) || lang == Dictionaries.LangRu);
+        return rank <= 100_000 && _dicts.Check(lang, w);
+    }
+
+    private double Rarity(string w, int lang)
+    {
+        if (w.Length == 1) return 1.0;
+        int rank = _freq.Rank(lang, w);
+        return rank == int.MaxValue ? 6 : Math.Log10(Math.Max(rank, 1));
+    }
+
+    // ------------------------------------------------------------------ layout collisions and word shape
 
     public bool PreferOther(string core, int typedLang, string altCore, int altLang, int contextLang, out string why)
     {

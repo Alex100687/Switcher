@@ -128,29 +128,32 @@ internal static class SelfTest
             words = new[] { "ghbdtn", "ghbdtn/", "Ghbdtn", "hello", "руддщ", "привет", "ntrcn", "ыефке", "world", "vbh", "мир",
                             "првиет", "hlelo", "tset", "проект", "лол", "хз", "in", "шт", "ok", "да", "lf", "ща", "elif", "foreach", "ghbdtn,", "vjcrdf" };
 
+        // the physical keys that type a word in the layout its first letter belongs to
+        (List<TypedKey>? keys, IntPtr typedHkl, IntPtr otherHkl) Type(string w)
+        {
+            bool cyr = w.Any(c => c >= 'А' && c <= 'я' || c == 'ё' || c == 'Ё');
+            var typedHkl = cyr ? ru : en;
+            var keys = new List<TypedKey>();
+            foreach (var ch in w)
+            {
+                short r = VkKeyScanExW(ch, typedHkl);
+                if (r == -1) return (null, typedHkl, cyr ? en : ru);
+                uint vk = (uint)(r & 0xFF);
+                keys.Add(new TypedKey(vk, Native.MapVirtualKeyEx(vk, 0, typedHkl), (r & 0x100) != 0, false));
+            }
+            return (keys, typedHkl, cyr ? en : ru);
+        }
+
         foreach (var raw in words)
         {
+            if (raw.Contains(' ')) { Sequence(raw); continue; }
             int ctx = 0; var w = raw;
             if (w.StartsWith("ru:")) { ctx = Dictionaries.LangRu; w = w[3..]; }
             else if (w.StartsWith("en:")) { ctx = Dictionaries.LangEn; w = w[3..]; }
             if (Environment.GetEnvironmentVariable("SWITCHER_DEBUG") == "1")
                 Console.WriteLine("  chars: " + string.Join(" ", w.Select(c => ((int)c).ToString("X4"))));
-            bool cyr = w.Any(c => c >= 'А' && c <= 'я' || c == 'ё' || c == 'Ё');
-            var typedHkl = cyr ? ru : en;
-            var otherHkl = cyr ? en : ru;
-
-            var keys = new List<TypedKey>();
-            bool ok = true;
-            foreach (var ch in w)
-            {
-                short r = VkKeyScanExW(ch, typedHkl);
-                if (r == -1) { ok = false; break; }
-                uint vk = (uint)(r & 0xFF);
-                bool shift = (r & 0x100) != 0;
-                uint scan = Native.MapVirtualKeyEx(vk, 0, typedHkl);
-                keys.Add(new TypedKey(vk, scan, shift, false));
-            }
-            if (!ok) { Console.WriteLine($"{w,-14} ?  (cannot type this in {Layouts.Name(typedHkl)})"); continue; }
+            var (keys, typedHkl, otherHkl) = Type(w);
+            if (keys == null) { Console.WriteLine($"{w,-14} ?  (cannot type this in {Layouts.Name(typedHkl)})"); continue; }
 
             string typed = WordTracker.Render(keys, typedHkl);
             string alt = WordTracker.Render(keys, otherHkl);
@@ -158,13 +161,16 @@ internal static class SelfTest
 
             sw.Restart();
             var d = corrector.Decide(typed, Native.LangId(typedHkl), alt, Native.LangId(otherHkl), hasDigits, ctx);
-            if (d.Kind == ActionKind.FixSpelling) d = speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout, ctx);
+            if (d.Kind == ActionKind.FixSpelling)
+                d = corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout, ctx),
+                                       typed, Native.LangId(typedHkl), Native.LangId(otherHkl), false);
             long ms = sw.ElapsedMilliseconds;
 
             string verdict = d.Kind switch
             {
                 ActionKind.SwitchLayout => $"SWITCH → {d.NewText}",
                 ActionKind.FixSpelling => (d.SwitchLayout ? "FIX+SW → " : "FIX    → ") + d.NewText,
+                ActionKind.Replace => $"CASE   → {d.NewText}",
                 _ => "keep",
             };
             Console.WriteLine($"{typed,-14} alt={alt,-14} {verdict,-24} {ms,4} ms  {d.Reason}");
@@ -172,5 +178,48 @@ internal static class SelfTest
                 Console.WriteLine("    suggest: " + string.Join(" | ", dicts.Suggest(Native.LangId(typedHkl), Corrector.StripPunctuation(typed, out _, out _).ToLowerInvariant()).Take(8)));
         }
         return 0;
+
+        // A line of several words, typed one after another with a space: what would the text on screen become?
+        // Exercises what depends on the words before (spaces, punctuation, short words, sentence starts).
+        void Sequence(string line)
+        {
+            var screen = new System.Text.StringBuilder();
+            PrevWord? prev = null;
+            bool sentence = false;
+            var notes = new List<string>();
+            foreach (var w in line.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var (keys, typedHkl, otherHkl) = Type(w);
+                if (keys == null) { Console.WriteLine($"{line}  ?  (cannot type '{w}')"); return; }
+                int tl = Native.LangId(typedHkl), al = Native.LangId(otherHkl);
+                string typed = WordTracker.Render(keys, typedHkl), alt = WordTracker.Render(keys, otherHkl);
+                var d = corrector.Decide(typed, tl, alt, al, keys.Any(k => WordTracker.IsDigitKey(k.Vk)), 0, new WordContext(sentence, prev));
+                if (d.Kind == ActionKind.FixSpelling)
+                {
+                    d = corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout), typed, tl, al, sentence);
+                    if (d.Kind != ActionKind.FixSpelling) d = Decision.Keep;
+                }
+                string text;
+                if (d.Kind == ActionKind.None)
+                {
+                    text = typed;
+                    prev = new PrevWord(typed, tl, alt, al, false, sentence, prev);
+                }
+                else
+                {
+                    screen.Length -= d.ErasePrevious;
+                    text = d.NewText;
+                    int lang = d.Kind == ActionKind.SwitchLayout || d.SwitchLayout ? al : tl;
+                    var rest = prev;
+                    bool started = sentence;
+                    for (int i = 0; i < d.PreviousWords && rest != null; i++) { started = rest.StartedSentence; rest = rest.Before; }
+                    prev = new PrevWord(text, lang, d.PreviousText + typed, tl, true, started, rest);
+                    notes.Add(d.Reason);
+                }
+                screen.Append(text).Append(' ');
+                sentence = Corrector.EndsSentence(text);
+            }
+            Console.WriteLine($"{line,-28} → {screen.ToString().TrimEnd(),-28} {string.Join("; ", notes)}");
+        }
     }
 }

@@ -11,7 +11,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>Switcher</AssemblyName>
     <RootNamespace>Switcher</RootNamespace>
-    <Version>0.4.0</Version>
+    <Version>0.5.0</Version>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <InvariantGlobalization>false</InvariantGlobalization>
   </PropertyGroup>

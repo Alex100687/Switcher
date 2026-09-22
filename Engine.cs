@@ -61,9 +61,23 @@ public sealed class Engine : IDisposable
     {
         Interlocked.Increment(ref _epoch);
         _word.Reset();
-        lock (_lock) _last = null;
+        lock (_lock) { _last = null; _sentenceHwnd = IntPtr.Zero; }
         _passwords.Forget();
     }
+
+    /// <summary>
+    /// Does the next word start right after a boundary we saw (a space, Enter, a click into a field)? After arrows,
+    /// Delete, Backspace into text or a paste the caret may sit right after other letters, and the "word" typed there
+    /// is the tail of a longer one — spelling, capitals and spaces cannot be judged on it. Hook thread only.
+    /// </summary>
+    private bool _anchored = true;
+    private IntPtr _lastHwnd;
+
+    /// <summary>The last word typed in this window ended a sentence: the next one gets a capital.</summary>
+    private IntPtr _sentenceHwnd;
+    private bool _sentenceStart;
+    private bool SentenceStartFor(IntPtr hwnd) { lock (_lock) return _sentenceHwnd == hwnd && _sentenceStart; }
+    private void SetSentence(IntPtr hwnd, bool start) { lock (_lock) { _sentenceHwnd = hwnd; _sentenceStart = start; } }
 
     /// <summary>Set by the host once dictionaries, frequencies and the warm-up are done; nothing is processed before.</summary>
     public volatile bool Ready;
@@ -86,10 +100,25 @@ public sealed class Engine : IDisposable
     /// <paramref name="TypedCore"/> is the word as the user typed it (what an undo restores and what may become a
     /// personal word); <paramref name="RejectFrom"/> is the form the corrector saw when it chose the replacement —
     /// for a fix in the other layout that is the other layout's rendering (";spym" was fixed as "жызнь" → "жизнь").
+    /// <paramref name="Learn"/>: an undo of this change is remembered as "don't". <paramref name="StartedSentence"/>:
+    /// the word began a sentence. <paramref name="Whole"/>: it began at a boundary we saw (not the tail of a longer word).
+    /// <paramref name="Prev"/>: the words right before it, each followed by one space (up to three) — for fixes that
+    /// span words ("ка кдела", "z ljvf").
     /// </summary>
     private sealed record LastWord(string Text, IntPtr Layout, string AltText, IntPtr AltLayout,
-        int TrailingVk, IntPtr Hwnd, DateTime Time, bool WasAuto, string TypedCore, string RejectFrom);
+        int TrailingVk, IntPtr Hwnd, DateTime Time, bool WasAuto, string TypedCore, string RejectFrom,
+        bool Learn, bool StartedSentence, bool Whole, LastWord? Prev);
     private LastWord? _last;
+
+    /// <summary>The previous words as the corrector needs them — only while we know they are right before the caret.</summary>
+    private static PrevWord? ToPrev(LastWord? w, IntPtr hwnd) =>
+        w == null || w.Hwnd != hwnd || w.TrailingVk != Native.VK_SPACE || !w.Whole ? null
+        : new PrevWord(w.Text, Native.LangId(w.Layout), w.AltText, Native.LangId(w.AltLayout), w.WasAuto, w.StartedSentence, ToPrev(w.Prev, hwnd));
+
+    private static LastWord? Trim(LastWord? w, int depth) => w == null || depth == 0 ? null : w with { Prev = Trim(w.Prev, depth - 1) };
+
+    /// <summary>The chain of previous words after <paramref name="skip"/> of them were merged into a replacement.</summary>
+    private static LastWord? Skip(LastWord? w, int skip) { for (int i = 0; i < skip && w != null; i++) w = w.Prev; return w; }
 
     /// <summary>
     /// An Enter/Tab held back while its word's spelling fix is computed (in a chat Enter would send the unfixed word).
@@ -173,6 +202,9 @@ public sealed class Engine : IDisposable
     {
         ReleaseHeld(); // the click has not reached the app yet: a held Enter still lands where it was pressed
         Invalidate();
+        // A click usually puts the caret into a field or between words; treating the next word as whole keeps the
+        // first word after a click correctable (clicking right after a word's last letter and going on is rarer).
+        _anchored = true;
         _passwords.Touch(Native.GetForegroundWindow());
     }
 
@@ -183,7 +215,7 @@ public sealed class Engine : IDisposable
         {
             // Another program typed into the field (auto-type, a macro, another switcher): the buffer no longer
             // matches the screen, and erasing "our" word would erase theirs.
-            if (e.Foreign && !IsModifierKey(e.Vk)) Invalidate();
+            if (e.Foreign && !IsModifierKey(e.Vk)) { Invalidate(); _anchored = false; }
             return false; // our own output — never react to it
         }
 
@@ -204,13 +236,14 @@ public sealed class Engine : IDisposable
             // snapshot on the hook thread, act on a worker thread
             IReadOnlyList<TypedKey>? keys = null;
             IntPtr wordLayout = IntPtr.Zero;
+            bool wordAnchored = _word.Anchored;
             if (!_word.IsEmpty && _word.Hwnd == hk)
             {
                 keys = _word.Snapshot();
                 wordLayout = _word.Layout;
             }
             _word.Reset();
-            SafeRun(() => HandleHotkey(hk, keys, wordLayout)); // inside the callback: injection is atomic here
+            SafeRun(() => HandleHotkey(hk, keys, wordLayout, wordAnchored)); // inside the callback: injection is atomic here
             return true;
         }
 
@@ -224,6 +257,10 @@ public sealed class Engine : IDisposable
         if (Native.IsDown(Native.VK_CONTROL) || Native.IsDown(Native.VK_MENU) || winDown)
         {
             Invalidate();
+            // after a paste, undo or cut the caret may sit right after other letters; Ctrl+arrows, Ctrl+Backspace,
+            // Ctrl+A, Alt+Tab leave it at a word boundary or in another field
+            if (vk is 'V' or 'Z' or 'Y' or 'X' or Native.VK_INSERT) _anchored = false;
+            else if (!(vk is 'C')) _anchored = true;
             return false;
         }
 
@@ -231,6 +268,7 @@ public sealed class Engine : IDisposable
         var layout = Layouts.Current(hwnd);
         _passwords.Touch(hwnd); // background refresh; never blocks
 
+        if (hwnd != _lastHwnd) { _lastHwnd = hwnd; _anchored = true; } // focus moved to another window: a fresh start there
         if (!_word.IsEmpty && hwnd != _word.Hwnd) Invalidate();
         else if (!_word.IsEmpty && layout != IntPtr.Zero && layout != _word.Layout)
         {
@@ -242,22 +280,39 @@ public sealed class Engine : IDisposable
         if (WordTracker.IsWordKey(vk))
         {
             if (layout == IntPtr.Zero) { Invalidate(); return false; }
-            _word.Push(vk, e.Scan, layout, hwnd);
+            _word.Push(vk, e.Scan, layout, hwnd, _anchored);
             return false;
         }
 
         if (vk == Native.VK_BACK)
         {
-            if (_word.IsEmpty) Invalidate(); // deleting into the previous word — we no longer know what's there
-            else _word.Backspace();
+            if (!_word.IsEmpty)
+            {
+                bool wordWasWhole = _word.Anchored;
+                _word.Backspace();
+                if (_word.IsEmpty) _anchored = wordWasWhole; // back at the start of the word: same left side as when it began
+                return false;
+            }
+            // Deleting the space after the last word: that word is being edited again — put it back into the buffer
+            // whole, so what is typed next is judged together with it ("превет", Backspace ×3, "вет").
+            if (TryReopen(hwnd)) return false;
+            Invalidate(); // deleting into text we do not know
+            _anchored = false;
             return false;
         }
 
         if (vk is Native.VK_SPACE or Native.VK_RETURN or Native.VK_TAB)
         {
+            _anchored = true; // whatever comes next starts right after this boundary
             // A second space, an empty line: the last word is no longer right before the caret — neither an undo
-            // nor a pending fix may count characters back from here.
-            if (_word.IsEmpty) { Invalidate(); return false; }
+            // nor a pending fix may count characters back from here. A sentence that ended stays ended.
+            if (_word.IsEmpty)
+            {
+                bool sentence = vk != Native.VK_TAB && SentenceStartFor(hwnd);
+                Invalidate();
+                if (sentence) SetSentence(hwnd, true);
+                return false;
+            }
             // Shift+Enter etc. — let it through untouched, but the word is finished.
             if (vk != Native.VK_SPACE && Native.IsDown(Native.VK_SHIFT)) { Invalidate(); return false; }
             bool swallowed = OnWordBoundary((int)vk, hwnd);
@@ -267,7 +322,35 @@ public sealed class Engine : IDisposable
 
         // navigation, escape, delete, function keys… — word is abandoned
         Invalidate();
+        // Home puts the caret at the start of a line; arrows, End, Delete, PgUp/PgDn may leave it right after letters
+        if (vk == Native.VK_HOME) _anchored = true;
+        else if (vk is Native.VK_LEFT or Native.VK_RIGHT or Native.VK_UP or Native.VK_DOWN or Native.VK_END
+                 or Native.VK_DELETE or Native.VK_PRIOR or Native.VK_NEXT) _anchored = false;
         return false;
+    }
+
+    /// <summary>
+    /// Backspace right after "word␣": the space goes, and the word is before the caret again. Its keys are rebuilt from
+    /// its text (a corrected word no longer matches what was typed) and the buffer continues from there.
+    /// </summary>
+    private bool TryReopen(IntPtr hwnd)
+    {
+        LastWord? last;
+        lock (_lock) last = _last;
+        if (last == null || last.Hwnd != hwnd || last.TrailingVk != Native.VK_SPACE) return false;
+        // a replacement may have made several words ("в общем"): only the last one is right before the caret
+        int sp = last.Text.LastIndexOf(' ');
+        string word = sp >= 0 ? last.Text[(sp + 1)..] : last.Text;
+        var keys = word.Length == 0 ? null : WordTracker.KeysFor(word, last.Layout);
+        if (keys == null) return false;
+        Interlocked.Increment(ref _epoch);
+        (string, string)? reopened = last.WasAuto && last.Learn && sp < 0
+            ? (last.RejectFrom, Corrector.StripPunctuation(last.Text, out _, out _)) : null;
+        _word.Restore(keys, last.Layout, hwnd, anchored: sp < 0 && last.Whole, reopened: reopened);
+        lock (_lock) _last = sp < 0 ? last.Prev : null;
+        SetSentence(hwnd, sp < 0 && last.StartedSentence);
+        if (Debug) Log.Write($"reopened '{word}' for editing");
+        return true;
     }
 
     /// <summary>Ask the window to switch, then make sure it did; some apps ignore the request — press the system hotkey.</summary>
@@ -327,7 +410,6 @@ public sealed class Engine : IDisposable
         Injector.Replace(typed.Length, flipped);
         _word.SetLayout(newLayout);
         SetContext(hwnd, newLang);
-        Remember(flipped, newLayout, typed, oldLayout, 0, hwnd, wasAuto: true);
         ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {flipped}  [manual layout switch]")));
 
         // now the key that revealed the switch
@@ -353,48 +435,68 @@ public sealed class Engine : IDisposable
         var layout = _word.Layout;
         var other = Layouts.Other(layout);
         var keys = _word.Snapshot();
-        bool hasDigits = _word.HasDigits;
+        bool hasDigits = _word.HasDigits, whole = _word.Anchored, forced = _word.Forced;
+        var reopened = _word.Reopened;
         _word.Reset();
         int epoch = Interlocked.Increment(ref _epoch);
-        lock (_lock) _last = null; // the previous word is no longer right before the caret
-
-        if (other == IntPtr.Zero || !CanRewrite(hwnd)) return false;
+        LastWord? before;
+        lock (_lock) { before = _last; _last = null; } // the previous word is no longer right before the caret
+        if (before != null && (before.Hwnd != hwnd || before.TrailingVk != Native.VK_SPACE)) before = null;
+        bool sentenceStart = SentenceStartFor(hwnd);
 
         string typed = WordTracker.Render(keys, layout);
+        // does the next word start a sentence? (after Tab the caret is in another field: unknown there)
+        void NoteSentence(string finalText) => SetSentence(hwnd, boundaryVk != Native.VK_TAB && Corrector.EndsSentence(finalText));
+
+        if (other == IntPtr.Zero || !CanRewrite(hwnd) || typed.Length == 0) { NoteSentence(typed); return false; }
+
         string alt = WordTracker.Render(keys, other);
-        if (Debug) Log.Write($"boundary typed='{typed}' alt='{alt}'");
-        if (typed.Length == 0) return false;
+        if (Debug) Log.Write($"boundary typed='{typed}' alt='{alt}' whole={whole} sentence={sentenceStart}");
 
         int typedLang = Native.LangId(layout);
         int altLang = Native.LangId(other);
 
         int ctx = ContextFor(hwnd);
         RuleScope.Current = ProcessName(hwnd); // app-specific rules apply on this thread from here on
-        var decision = _corrector.Decide(typed, typedLang, alt, altLang, hasDigits, ctx);
-        if (Debug) Log.Write($"decide '{typed}' ctx={Corrector.LangName(ctx)} → {decision.Kind} {decision.Reason}");
+        var context = new WordContext(sentenceStart, ToPrev(before, hwnd), Fragment: !whole);
+        // the user picked this word's layout with the hotkey: it stays as it is
+        var decision = forced ? Decision.Keep : _corrector.Decide(typed, typedLang, alt, altLang, hasDigits, ctx, context);
+        if ((decision.Kind is ActionKind.SwitchLayout or ActionKind.Replace) && UserReverted(reopened, typed, decision.NewText))
+            decision = Decision.Keep;
+        if (Debug) Log.Write($"decide '{typed}' ctx={Corrector.LangName(ctx)} → {decision.Kind} '{decision.NewText}' {decision.Reason}");
 
         switch (decision.Kind)
         {
             case ActionKind.None:
                 if (_corrector.IsRealWord(typedLang, typed)) SetContext(hwnd, typedLang);
-                Remember(typed, layout, alt, other, boundaryVk, hwnd, wasAuto: false);
+                Remember(typed, layout, alt, other, boundaryVk, hwnd, wasAuto: false, prev: before, startedSentence: sentenceStart, whole: whole);
+                NoteSentence(typed);
                 return false;
 
             case ActionKind.SwitchLayout:
-                if (_passwords.IsPasswordField(hwnd)) return false; // never rewrite a password
+            case ActionKind.Replace:
+                if (_passwords.IsPasswordField(hwnd)) { NoteSentence(typed); return false; } // never rewrite a password
+                bool switching = decision.Kind == ActionKind.SwitchLayout;
+                var target = switching ? other : layout;
                 // Synchronously, right here in the hook: our replacement keystrokes must be queued before
                 // whatever the user types next, otherwise a fast typist gets the two words interleaved.
-                SwitchLayoutVerified(hwnd, other);
+                if (switching) SwitchLayoutVerified(hwnd, other);
                 var sws = System.Diagnostics.Stopwatch.StartNew();
-                Injector.Replace(typed.Length, alt, boundaryVk);
+                Injector.Replace(decision.ErasePrevious + typed.Length, decision.NewText, boundaryVk);
+                if (decision.CapsOff && Native.IsToggled(Native.VK_CAPITAL)) Injector.PressKey(Native.VK_CAPITAL);
                 if (Debug) Log.Write($"  sync Replace took {sws.ElapsedMilliseconds} ms inCallback={KeyboardHook.InCallback}");
-                SetContext(hwnd, altLang);
-                Remember(alt, other, typed, layout, boundaryVk, hwnd, wasAuto: true);
-                ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{typed} → {alt}  [{decision.Reason}]")));
+                SetContext(hwnd, Native.LangId(target));
+                // one entry for everything the replacement covered (previous words included): Pause restores all of it
+                bool started = decision.PreviousWords > 0 ? Skip(before, decision.PreviousWords - 1)?.StartedSentence ?? false : sentenceStart;
+                string oldText = decision.PreviousText + typed;
+                Remember(decision.NewText, target, oldText, layout, boundaryVk, hwnd, wasAuto: true,
+                    prev: Skip(before, decision.PreviousWords), startedSentence: started, learn: decision.Learn);
+                NoteSentence(decision.NewText);
+                ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{oldText} → {decision.NewText}  [{decision.Reason}]")));
                 return true;
 
             case ActionKind.FixSpelling:
-                if (_passwords.IsPasswordField(hwnd)) return false;
+                if (_passwords.IsPasswordField(hwnd)) { NoteSentence(typed); return false; }
                 // Suggest takes ~100 ms, so this runs on a worker. A space goes through to the app right away
                 // (no typing lag); Enter/Tab are held back, because in a chat Enter would send the unfixed word.
                 string boundary = boundaryVk switch { Native.VK_RETURN => "\n", Native.VK_TAB => "\t", _ => " " };
@@ -405,16 +507,39 @@ public sealed class Engine : IDisposable
                     if (previous != null && TakeHeld(previous)) Injector.PressKey(previous.Vk); // never lose a user's key
                 }
                 var focus = Injector.FocusWindow(hwnd);
-                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, held, boundary, epoch, ctx, RuleScope.Current));
+                NoteSentence(typed); // for now: a fix in the other layout may change the punctuation — ApplyFix updates it
+                SubmitFix(new FixRequest(typed, layout, alt, other, hwnd, focus, boundaryVk, held, boundary, epoch, ctx, RuleScope.Current,
+                    sentenceStart, before, reopened));
                 return held != null;
         }
         return false;
     }
 
+    /// <summary>
+    /// The user reopened a word we had corrected (Backspace) and typed it back as it was: correcting it again would be
+    /// a fight. The replacement is remembered as rejected, like an undo with Pause.
+    /// </summary>
+    private bool UserReverted((string From, string To)? reopened, string typed, string newText)
+    {
+        if (reopened is not { } r) return false;
+        var core = Corrector.StripPunctuation(typed, out _, out _);
+        var newCore = Corrector.StripPunctuation(newText, out _, out _);
+        if (!core.Equals(r.From, StringComparison.OrdinalIgnoreCase) || !newCore.Equals(r.To, StringComparison.OrdinalIgnoreCase)) return false;
+        var scope = RuleScope.Current;
+        ThreadPool.QueueUserWorkItem(_ => SafeRun(() =>
+        {
+            RuleScope.Current = scope;
+            _exceptions.Reject(r.From, r.To);
+            Report($"[edited back] '{r.From}' → '{r.To}' больше не предлагается");
+        }));
+        return true;
+    }
+
     // ------------------------------------------------------------------ spell-fix worker: one running, one pending
 
     private sealed record FixRequest(string Typed, IntPtr Layout, string Alt, IntPtr Other, IntPtr Hwnd, IntPtr Focus,
-        int BoundaryVk, HeldBoundary? Held, string Boundary, int Epoch, int Ctx, string Scope);
+        int BoundaryVk, HeldBoundary? Held, string Boundary, int Epoch, int Ctx, string Scope,
+        bool SentenceStart, LastWord? Before, (string From, string To)? Reopened);
 
     private FixRequest? _pendingFix;
     private readonly SemaphoreSlim _fixSignal = new(0);
@@ -451,6 +576,8 @@ public sealed class Engine : IDisposable
             {
                 RuleScope.Current = r.Scope;
                 fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
+                // names, abbreviations and the start of a sentence get their capitals here too
+                fix = _corrector.AfterFix(fix, r.Typed, Native.LangId(r.Layout), Native.LangId(r.Other), r.SentenceStart);
             }
             catch (Exception ex)
             {
@@ -480,7 +607,7 @@ public sealed class Engine : IDisposable
         if (!CanRewrite(r.Hwnd)) { if (Debug) Log.Write("fix dropped: window may not be rewritten"); DeliverHeld(); return; }
         if (_passwords.IsPasswordField(r.Hwnd)) { if (Debug) Log.Write("fix dropped: password field"); DeliverHeld(); return; }
 
-        bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != r.Typed;
+        bool fixing = fix.Kind == ActionKind.FixSpelling && fix.NewText != r.Typed && !UserReverted(r.Reopened, r.Typed, fix.NewText);
         bool hold = held != null;
 
         // Meanwhile the user may have typed the first letters of the next word: fine, we erase and retype
@@ -519,32 +646,37 @@ public sealed class Engine : IDisposable
 
         if (!fixing)
         {
-            Remember(r.Typed, r.Layout, r.Alt, r.Other, r.BoundaryVk, r.Hwnd, wasAuto: false);
+            Remember(r.Typed, r.Layout, r.Alt, r.Other, r.BoundaryVk, r.Hwnd, wasAuto: false, prev: r.Before, startedSentence: r.SentenceStart);
             return;
         }
         SetContext(r.Hwnd, Native.LangId(newLayout));
+        if (r.BoundaryVk != Native.VK_TAB) SetSentence(r.Hwnd, Corrector.EndsSentence(fix.NewText));
         // an undo must block the pair the corrector actually chose: for a fix in the other layout, that layout's form
         string? rejectFrom = fix.SwitchLayout ? Corrector.StripPunctuation(r.Alt, out _, out _) : null;
-        Remember(fix.NewText, newLayout, r.Typed, r.Layout, r.BoundaryVk, r.Hwnd, wasAuto: true, rejectFrom);
+        Remember(fix.NewText, newLayout, r.Typed, r.Layout, r.BoundaryVk, r.Hwnd, wasAuto: true, rejectFrom,
+            prev: r.Before, startedSentence: r.SentenceStart, learn: fix.Learn);
         ThreadPool.QueueUserWorkItem(_ => SafeRun(() => Report($"{r.Typed} → {fix.NewText}  [{fix.Reason}]")));
     }
 
     private void Remember(string text, IntPtr layout, string alt, IntPtr altLayout, int trailingVk, IntPtr hwnd, bool wasAuto,
-        string? rejectFrom = null)
+        string? rejectFrom = null, LastWord? prev = null, bool startedSentence = false, bool learn = true, bool whole = true)
     {
         // After Enter the word may be gone (chat message sent), after Tab the caret is in another field — nothing to undo.
         LastWord? lw = null;
         if (trailingVk is not (Native.VK_RETURN or Native.VK_TAB))
         {
             var typedCore = Corrector.StripPunctuation(wasAuto ? alt : text, out _, out _);
-            lw = new LastWord(text, layout, alt, altLayout, trailingVk, hwnd, DateTime.UtcNow, wasAuto, typedCore, rejectFrom ?? typedCore);
+            // only words still right before this one (one space between them) form the chain
+            var chain = prev != null && prev.Hwnd == hwnd && prev.TrailingVk == Native.VK_SPACE ? Trim(prev, 3) : null;
+            lw = new LastWord(text, layout, alt, altLayout, trailingVk, hwnd, DateTime.UtcNow, wasAuto, typedCore, rejectFrom ?? typedCore,
+                learn, startedSentence, whole, chain);
         }
         lock (_lock) _last = lw;
     }
 
     // ------------------------------------------------------------------ hotkey: convert / undo last word
 
-    private void HandleHotkey(IntPtr hwnd, IReadOnlyList<TypedKey>? keys, IntPtr layout)
+    private void HandleHotkey(IntPtr hwnd, IReadOnlyList<TypedKey>? keys, IntPtr layout, bool anchored)
     {
         // Case 1: a word is being typed right now → convert it in place.
         if (keys != null && keys.Count > 0)
@@ -557,7 +689,9 @@ public sealed class Engine : IDisposable
             SwitchLayoutVerified(hwnd, other);
             Injector.Replace(typed.Length, alt);
             SetContext(hwnd, Native.LangId(other));
-            Remember(alt, other, typed, layout, 0, hwnd, wasAuto: false);
+            // The word goes on in the chosen layout ("ghb", Pause, "вет"): it stays in the buffer as one word, and its
+            // layout — the user's choice — is not second-guessed at the boundary.
+            _word.Restore(keys, other, hwnd, anchored, forced: true);
             Report($"[hotkey] {typed} → {alt}");
             return;
         }
@@ -574,11 +708,11 @@ public sealed class Engine : IDisposable
             Native.VK_TAB => "\t",
             _ => "",
         };
-        SwitchLayoutVerified(hwnd, last.AltLayout);
+        if (last.AltLayout != last.Layout) SwitchLayoutVerified(hwnd, last.AltLayout);
         Injector.Replace(last.Text.Length + trailing.Length, last.AltText + trailing);
         SetContext(hwnd, Native.LangId(last.AltLayout));
 
-        if (last.WasAuto)
+        if (last.WasAuto && last.Learn)
         {
             // the user disagreed with us: never offer this particular replacement again; after several rejections
             // of the same word, the word itself becomes a personal word (file I/O off the hook thread)
@@ -592,7 +726,7 @@ public sealed class Engine : IDisposable
                 int n = _exceptions.Reject(from, to, word);
                 Report($"[undo] {last.Text} → {last.AltText}; замена '{from}' → '{to}' больше не предлагается");
                 bool ask;
-                lock (_lock) ask = n >= Rules.UndosToSuggest && !_exceptions.Contains(word) && _suggested.Add(word);
+                lock (_lock) ask = n >= Rules.UndosToSuggest && !word.Contains(' ') && !_exceptions.Contains(word) && _suggested.Add(word);
                 if (ask) SuggestWord?.Invoke(word); // the tray asks the user; nothing is learned silently
             }));
         }

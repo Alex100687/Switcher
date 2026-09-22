@@ -27,6 +27,7 @@ npx
 yarn
 pnpm
 nuget
+hunspell
 pip
 venv
 conda

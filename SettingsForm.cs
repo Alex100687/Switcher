@@ -24,8 +24,8 @@ public sealed class SettingsForm : Form
         _settings = settings; _rules = rules; _engine = engine; _saved = onSaved;
         Text = "Switcher — настройки";
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(640, 560);
-        MinimumSize = new Size(560, 460);
+        Size = new Size(640, 650);
+        MinimumSize = new Size(560, 560);
         Font = new Font("Segoe UI", 9.5f);
         MaximizeBox = false;
         ShowInTaskbar = true;
@@ -73,6 +73,9 @@ public sealed class SettingsForm : Form
         Check(grid, "Включено", () => _settings.Enabled, v => _settings.Enabled = v);
         Check(grid, "Автопереключение раскладки (ghbdtn → привет)", () => _settings.AutoSwitchLayout, v => _settings.AutoSwitchLayout = v);
         Check(grid, "Автоисправление опечаток (жызнь → жизнь)", () => _settings.AutoFixSpelling, v => _settings.AutoFixSpelling = v);
+        Check(grid, "Регистр: ПОжалуйста, пРИВЕТ (Caps Lock), москва → Москва, сша → США", () => _settings.FixCase, v => _settings.FixCase = v);
+        Check(grid, "Заглавная буква в начале предложения", () => _settings.CapitalizeSentences, v => _settings.CapitalizeSentences = v);
+        Check(grid, "Пробелы: ка кдела → как дела, привет ,как → привет, как", () => _settings.FixSpaces, v => _settings.FixSpaces = v);
         Check(grid, "Звук при замене", () => _settings.Beep, v => _settings.Beep = v);
         Check(grid, "Записывать заменённые слова в лог", () => _settings.LogActions, v => _settings.LogActions = v);
         Check(grid, "Запускать при входе в Windows", TrayApp.IsAutostart, TrayApp.SetAutostart);

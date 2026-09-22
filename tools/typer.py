@@ -4,7 +4,7 @@
 
 <text> is written in US-layout letters ("ghbdtn" = the keys that give "привет" in RU); the receiving app
 interprets the keys in whatever layout it currently has, exactly like a real keyboard. Tokens: {BS} {ENTER}
-{TAB} {F9} {PAUSE} {ALTSHIFT} {SLEEP:ms}.
+{TAB} {F9} {PAUSE} {CAPS} {ALTSHIFT} {SLEEP:ms}.
 """
 import ctypes
 import ctypes.wintypes as w
@@ -65,7 +65,7 @@ def main():
     # map characters through the US layout (handle only, not activated)
     hkl = user32.LoadKeyboardLayoutW("00000409", 0)
     SHIFT_SCAN = 0x2A
-    tokens = {"BS": 0x0E, "ENTER": 0x1C, "TAB": 0x0F, "F9": 0x43, "PAUSE": 0x45}
+    tokens = {"BS": 0x0E, "ENTER": 0x1C, "TAB": 0x0F, "F9": 0x43, "PAUSE": 0x45, "CAPS": 0x3A}
     t0 = time.perf_counter(); sent = 0
     i = 0
     while i < len(text):

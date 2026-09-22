@@ -163,7 +163,7 @@ internal static class SelfTest
             var d = corrector.Decide(typed, Native.LangId(typedHkl), alt, Native.LangId(otherHkl), hasDigits, ctx);
             if (d.Kind == ActionKind.FixSpelling)
                 d = corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout, ctx),
-                                       typed, Native.LangId(typedHkl), Native.LangId(otherHkl), false);
+                                       typed, alt, Native.LangId(typedHkl), Native.LangId(otherHkl), false);
             long ms = sw.ElapsedMilliseconds;
 
             string verdict = d.Kind switch
@@ -196,7 +196,7 @@ internal static class SelfTest
                 var d = corrector.Decide(typed, tl, alt, al, keys.Any(k => WordTracker.IsDigitKey(k.Vk)), 0, new WordContext(sentence, prev));
                 if (d.Kind == ActionKind.FixSpelling)
                 {
-                    d = corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout), typed, tl, al, sentence);
+                    d = corrector.AfterFix(speller.FixEither(typed, typedHkl, alt, otherHkl, settings.AutoSwitchLayout), typed, alt, tl, al, sentence);
                     if (d.Kind != ActionKind.FixSpelling) d = Decision.Keep;
                 }
                 string text;

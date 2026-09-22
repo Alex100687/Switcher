@@ -21,6 +21,8 @@ public sealed record Decision(ActionKind Kind, string NewText, string Reason, do
     public bool CapsOff { get; init; }
     /// <summary>Undoing it teaches nothing: a capital at the start of a sentence is about the place, not the word.</summary>
     public bool Learn { get; init; } = true;
+    /// <summary>The spelling fixer's edit cost (without the rarity penalty of <see cref="Score"/>).</summary>
+    public double Cost { get; init; }
 
     public static readonly Decision Keep = new(ActionKind.None, "", "");
 }
@@ -121,6 +123,12 @@ public sealed class Corrector
             slipTyped = unslipped != core; slipAlt = altUnslipped != altCore;
             core = unslipped; altCore = altUnslipped;
         }
+        // A shift slip and a typo at once ("ППривет" — the first key twice, "ПРивте"): the fixer may find the word;
+        // AfterFix takes its answer only if it fits a slip, so "ПКшка", "ДРшка" (abbreviation + suffix) stay.
+        if (_settings.FixCase && _settings.AutoFixSpelling && !slipTyped && !slipAlt
+            && (IsSlipPattern(core) || (_settings.AutoSwitchLayout && IsSlipPattern(altCore)))
+            && core.Length <= 20)
+            return new Decision(ActionKind.FixSpelling, "", "shift slip, unknown word");
         // myVar, GameObject — code, not prose. (The other layout of a shift slip has the same odd capitals —
         // "ПОжалуйста" is "GJ;fkeqcnf" — which says nothing once one side reads as a word.)
         if ((IsCamelCase(core) && !slipAlt) || (IsCamelCase(altCore) && !slipTyped)) return Decision.Keep;
@@ -176,10 +184,22 @@ public sealed class Corrector
     /// The worker's spelling fix gets the same letter case treatment as the synchronous decisions; an unknown word
     /// the fixer left alone may still need a capital (a name at the start of a sentence).
     /// </summary>
-    public Decision AfterFix(Decision fix, string typed, int typedLang, int otherLang, bool sentenceStart)
+    public Decision AfterFix(Decision fix, string typed, string alt, int typedLang, int otherLang, bool sentenceStart)
     {
         if (fix.Kind == ActionKind.FixSpelling && fix.NewText.Length > 0)
+        {
+            // the word as the fixer saw it — in the other layout for a fix with a switch
+            var source = StripPunctuation(fix.SwitchLayout ? alt : typed, out _, out _);
+            var result = StripPunctuation(fix.NewText, out var pre, out var suf);
+            if (IsSlipPattern(source))
+            {
+                if (!FitsShiftSlip(source, result, fix.Cost)) return AfterFix(Decision.Keep, typed, alt, typedLang, otherLang, sentenceStart);
+                // "пРИВТЕ" (Caps Lock + a typo): the fixer copies the small first letter — it is a capital; Caps Lock goes off
+                if (IsInvertedCaps(source))
+                    fix = fix with { NewText = pre + char.ToUpperInvariant(result[0]) + result[1..].ToLowerInvariant() + suf, CapsOff = true };
+            }
             return fix with { NewText = Recase(fix.NewText, fix.SwitchLayout ? otherLang : typedLang, sentenceStart) };
+        }
         var cased = Recase(typed, typedLang, sentenceStart);
         if (cased == typed) return fix;
         bool onlySentence = Recase(typed, typedLang, false) == typed;
@@ -239,6 +259,23 @@ public sealed class Corrector
         if (s.Length < 4 || !IsPureLetters(s) || !char.IsUpper(s[0]) || !char.IsUpper(s[1])) return false;
         for (int i = 2; i < s.Length; i++) if (!char.IsLower(s[i])) return false;
         return true;
+    }
+
+    /// <summary>Capitals the way a held Shift or a forgotten Caps Lock leaves them.</summary>
+    public static bool IsSlipPattern(string s) => IsTwoCaps(s) || IsInvertedCaps(s);
+
+    /// <summary>
+    /// Can a fix of a shift-slip word be explained by the fingers? Either the first key was pressed twice ("ППривет" →
+    /// "Привет"), or the capitals were real letters of the word and one cheap slip came after ("ПРивте" → "Привет").
+    /// Not "ПКшка" → "Пушка" (the К is not a letter of "пушка") nor "ДРшка" → "Драка" (two edits): those are
+    /// abbreviations with a suffix.
+    /// </summary>
+    private static bool FitsShiftSlip(string original, string fixedCore, double cost)
+    {
+        var o = original.ToLowerInvariant();
+        var f = fixedCore.ToLowerInvariant();
+        if (o.Length >= 3 && o[0] == o[1] && f == o[1..]) return true;
+        return cost <= 0.75 && f.Length >= 2 && f[..2] == o[..2];
     }
 
     /// <summary>First letter small, all the others capital: Caps Lock was on and Shift pressed for the capital ("пРИВЕТ").</summary>

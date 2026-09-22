@@ -577,7 +577,7 @@ public sealed class Engine : IDisposable
                 RuleScope.Current = r.Scope;
                 fix = _speller.FixEither(r.Typed, r.Layout, r.Alt, r.Other, _settings.AutoSwitchLayout, r.Ctx);
                 // names, abbreviations and the start of a sentence get their capitals here too
-                fix = _corrector.AfterFix(fix, r.Typed, Native.LangId(r.Layout), Native.LangId(r.Other), r.SentenceStart);
+                fix = _corrector.AfterFix(fix, r.Typed, r.Alt, Native.LangId(r.Layout), Native.LangId(r.Other), r.SentenceStart);
             }
             catch (Exception ex)
             {
@@ -641,6 +641,7 @@ public sealed class Engine : IDisposable
         {
             var swi = System.Diagnostics.Stopwatch.StartNew();
             Injector.Replace(backspaces, text);
+            if (fixing && fix.CapsOff && Native.IsToggled(Native.VK_CAPITAL)) Injector.PressKey(Native.VK_CAPITAL); // "пРИВТЕ": Caps Lock was on by mistake
             if (Debug) Log.Write($"  Replace({backspaces}, '{text}') took {swi.ElapsedMilliseconds} ms on thread {Environment.CurrentManagedThreadId}");
         }
 

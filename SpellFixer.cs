@@ -106,23 +106,23 @@ public sealed class SpellFixer
 
         // explicit rules first — they may target hyphenated or dictionary words ("всё-же", "ихний")
         if (core.Length > 0 && _rules.TryAutocorrect(lower, out var explicitFix) && !_rules.IsBlocked(lower, explicitFix))
-            return Result(core, explicitFix, prefix, suffix, lang, "autocorrect", 0);
+            return Result(core, explicitFix, prefix, suffix, lang, "autocorrect", 0, 0);
         if (core.Length < 3 || !Corrector.IsPureLetters(core)) return Decision.Keep;
 
         if (_freq.Rank(lang, lower) <= KnownRankLimit(lang)) return Decision.Keep; // frequent colloquial word
 
         var norm = EditCost.Normalize(lower);
         bool capitalized = char.IsUpper(core[0]);
-        var best = ChooseBest(norm, lang, hkl, capitalized, out var reason, out var score);
+        var best = ChooseBest(norm, lang, hkl, capitalized, out var reason, out var score, out var cost);
         if (best == null) return Decision.Keep;
-        return Result(core, best, prefix, suffix, lang, reason, score);
+        return Result(core, best, prefix, suffix, lang, reason, score, cost);
     }
 
-    private static Decision Result(string core, string fix, string prefix, string suffix, int lang, string reason, double score)
+    private static Decision Result(string core, string fix, string prefix, string suffix, int lang, string reason, double score, double cost)
     {
         var cased = Corrector.MatchCase(core, fix);
         if (cased == core) return Decision.Keep;
-        return new Decision(ActionKind.FixSpelling, prefix + cased + suffix, $"'{core}' → '{cased}' ({Corrector.LangName(lang)}, {reason})", score);
+        return new Decision(ActionKind.FixSpelling, prefix + cased + suffix, $"'{core}' → '{cased}' ({Corrector.LangName(lang)}, {reason})", score) { Cost = cost };
     }
 
     private sealed record Cand(string Word, double Cost, int Rank)
@@ -134,9 +134,9 @@ public sealed class SpellFixer
             : 0.12 * Math.Log10(r) + (r > 20_000 ? 0.3 * (Math.Log10(r) - 4.3) : 0) + (r > 50_000 ? 0.4 * (Math.Log10(r) - 4.7) : 0);
     }
 
-    private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason, out double score)
+    private string? ChooseBest(string norm, int lang, IntPtr hkl, bool capitalized, out string reason, out double score, out double bestCost)
     {
-        reason = ""; score = 0;
+        reason = ""; score = 0; bestCost = 0;
         var seen = new Dictionary<string, int>(StringComparer.Ordinal); // normalized word → index in cands
         var cands = new List<Cand>();
 
@@ -232,6 +232,7 @@ public sealed class SpellFixer
 
         reason = $"cost {best.Cost:0.00}, rank {best.Rank}";
         score = best.Score;
+        bestCost = best.Cost;
         return best.Word;
     }
 }
